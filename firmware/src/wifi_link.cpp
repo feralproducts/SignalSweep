@@ -131,6 +131,7 @@ static void useTlsPsram() {
 // Counters for the /status page.
 static volatile uint32_t wsOpens = 0, httpsRequests = 0;
 static uint32_t linkStartedMs = 0;
+static uint32_t internalFreeBeforeLink = 0;
 
 // ============================================================================
 //  Certificates
@@ -576,7 +577,7 @@ static esp_err_t sendStatus(httpd_req_t* req) {
         "hotspot up for: %lu s   board up for: %lu s   last reset reason: %d\n"
         "phones joined: %d   app connections (websocket): %d   websocket opens: %lu\n"
         "https requests served: %lu   https server running: %s\n"
-        "internal RAM free: %u (lowest %u, largest block %u)\n"
+        "internal RAM free: %u (lowest %u, largest block %u, before hotspot %u)\n"
         "PSRAM free: %u of %u\n"
         "TLS memory in PSRAM: %s   fallbacks to internal: %lu\n"
         "lines dropped (slow phone): %lu\n",
@@ -585,7 +586,7 @@ static esp_err_t sendStatus(httpd_req_t* req) {
         WiFi.softAPgetStationNum(), (int)wsClientCount, (unsigned long)wsOpens,
         (unsigned long)httpsRequests, httpsServer ? "yes" : "NO",
         (unsigned)heap_caps_get_free_size(MALLOC_CAP_INTERNAL), (unsigned)heap_caps_get_minimum_free_size(MALLOC_CAP_INTERNAL),
-        (unsigned)heap_caps_get_largest_free_block(MALLOC_CAP_INTERNAL),
+        (unsigned)heap_caps_get_largest_free_block(MALLOC_CAP_INTERNAL), (unsigned)internalFreeBeforeLink,
         (unsigned)heap_caps_get_free_size(MALLOC_CAP_SPIRAM), (unsigned)heap_caps_get_total_size(MALLOC_CAP_SPIRAM),
         tlsAllocatorSet ? "yes" : "NO", (unsigned long)tlsPsramFallbacks,
         (unsigned long)txDropped);
@@ -635,6 +636,13 @@ static bool startServers() {
     sc.httpd.lru_purge_enable = true;
     sc.httpd.uri_match_fn = httpd_uri_match_wildcard;
     sc.httpd.stack_size = 16384;   // TLS handshake + ECDSA on this task
+    // Stacks in PSRAM (CONFIG_SPIRAM_ALLOW_STACK_EXTERNAL_MEMORY=y in this
+    // core). Field status page, 2026-10-22: with the hotspot up, internal RAM
+    // was down to ~15 KB free -- too little for the next connection, so the
+    // page half-loaded and the app's WebSocket never opened. These two server
+    // stacks plus the sender task's were ~24 KB of it. Neither server task
+    // writes flash, so a PSRAM stack is safe here.
+    sc.httpd.task_caps = MALLOC_CAP_SPIRAM | MALLOC_CAP_8BIT;
     if (httpd_ssl_start(&httpsServer, &sc) != ESP_OK) { httpsServer = NULL; return false; }
 
     httpd_uri_t ws = {};
@@ -650,6 +658,7 @@ static bool startServers() {
     hc.ctrl_port = ESP_HTTPD_DEF_CTRL_PORT + 2;   // the SSL server took +1
     hc.max_uri_handlers = 2;
     hc.max_open_sockets = 2;
+    hc.task_caps = MALLOC_CAP_SPIRAM | MALLOC_CAP_8BIT;
     hc.uri_match_fn = httpd_uri_match_wildcard;
     hc.lru_purge_enable = true;
     if (httpd_start(&httpServer, &hc) == ESP_OK) {
@@ -664,6 +673,7 @@ static bool startServers() {
 
 static void linkStart() {
     if (linkUp) return;
+    internalFreeBeforeLink = heap_caps_get_free_size(MALLOC_CAP_INTERNAL);
     parkForAp = true;
     vTaskDelay(pdMS_TO_TICKS(400));   // > one hop dwell: the hopper sees the park
     bool promisc = false;
@@ -754,7 +764,10 @@ void wifiLinkInit() {
         txRing = xRingbufferCreateWithCaps(WIFI_TX_RING_BYTES, RINGBUF_TYPE_NOSPLIT, MALLOC_CAP_SPIRAM | MALLOC_CAP_8BIT);
         if (!txRing) txRing = xRingbufferCreate(16 * 1024, RINGBUF_TYPE_NOSPLIT);
     }
-    if (txRing && !txTask) xTaskCreate(txTaskFn, "WifiLinkTx", 4096, NULL, 3, &txTask);
+    if (txRing && !txTask) {
+        if (xTaskCreateWithCaps(txTaskFn, "WifiLinkTx", 4096, NULL, 3, &txTask, MALLOC_CAP_SPIRAM | MALLOC_CAP_8BIT) != pdPASS)
+            xTaskCreate(txTaskFn, "WifiLinkTx", 4096, NULL, 3, &txTask);
+    }
     Preferences prefs;
     prefs.begin(WIFI_NVS_NS, true);
     apPass = prefs.getString("pass", WIFI_DEFAULT_PASS);
