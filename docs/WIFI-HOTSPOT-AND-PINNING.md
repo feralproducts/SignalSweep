@@ -53,7 +53,9 @@ With a phone on the hotspot, open **http://192.168.4.1/status** (plain http). It
 
 ### Will the map have street tiles over the hotspot?
 
-The board hands out an address without a "gateway", so a phone should keep using its **cellular data** for the internet (map tiles) while it talks to the board over Wi‑Fi. This behavior depends on the phone and **must be confirmed on your phones** (see the bench checklist). If tiles don't load, the app says so. Your position, the walked path, the estimate, and pins all still work, just over a blank background.
+Possibly not. The board's hotspot has no internet, and a phone joined to it may send its internet traffic (map tiles) to the hotspot rather than to cellular. iPhones sometimes fall back to cellular on their own ("Wi‑Fi Assist"); check this on your phones. If tiles don't load, the app says so. Your position, the walked path, the estimate, and pins all still work, and pinned coordinates open fine in Apple/Google Maps once you're off the board's Wi‑Fi.
+
+(An earlier build tried to force phones to keep cellular by leaving the "router" out of the address the board hands out. In the field that left an iPhone holding the board's own address, so it was removed.)
 
 ---
 

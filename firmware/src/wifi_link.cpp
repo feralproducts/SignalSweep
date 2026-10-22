@@ -51,7 +51,7 @@
 #define WIFI_RX_MAX_PENDING  (64 * 1024)
 
 static const char* TAG = "WifiLink";
-static const uint8_t AP_IP[4] = {192, 168, 4, 1};
+static const uint8_t AP_IP[4] = {192, 168, 4, 1};   // the certificate's IP SAN
 
 // ---- State -----------------------------------------------------------------
 static volatile bool linkUp = false;
@@ -63,6 +63,8 @@ static volatile int  pendingReq = -1;      // -1 none, 0 off, 1 on
 static volatile bool pendingRestart = false;
 static String apSsid;
 static String apPass;
+static String apAddr = "192.168.4.1";   // what the AP interface actually got
+static String lastLeases;                // addresses handed to phones, newest last
 static uint32_t idleSinceMs = 0;
 
 static httpd_handle_t httpsServer = NULL;
@@ -566,10 +568,11 @@ static const char SETUP_PAGE[] =
 // Plain-text health readout at http://192.168.4.1/status -- readable from any
 // phone on the hotspot, so a field problem can be diagnosed without a laptop.
 static esp_err_t sendStatus(httpd_req_t* req) {
-    char b[700];
+    char b[900];
     int n = snprintf(b, sizeof(b),
         "SignalSweep hotspot status\n"
-        "ssid: %s  channel: %d\n"
+        "ssid: %s  channel: %d  board address: %s\n"
+        "addresses given to phones: %s\n"
         "hotspot up for: %lu s   board up for: %lu s   last reset reason: %d\n"
         "phones joined: %d   app connections (websocket): %d   websocket opens: %lu\n"
         "https requests served: %lu   https server running: %s\n"
@@ -577,7 +580,7 @@ static esp_err_t sendStatus(httpd_req_t* req) {
         "PSRAM free: %u of %u\n"
         "TLS memory in PSRAM: %s   fallbacks to internal: %lu\n"
         "lines dropped (slow phone): %lu\n",
-        apSsid.c_str(), WIFI_LINK_CHANNEL,
+        apSsid.c_str(), WIFI_LINK_CHANNEL, apAddr.c_str(), lastLeases.length() ? lastLeases.c_str() : "(none yet)",
         (unsigned long)((millis() - linkStartedMs) / 1000), (unsigned long)(millis() / 1000), (int)esp_reset_reason(),
         WiFi.softAPgetStationNum(), (int)wsClientCount, (unsigned long)wsOpens,
         (unsigned long)httpsRequests, httpsServer ? "yes" : "NO",
@@ -606,20 +609,6 @@ static esp_err_t setupHandler(httpd_req_t* req) {
 static void reassertPromiscuous(bool wasOn) {
     // A mode change can drop promiscuous reception; put the detector's back.
     if (wasOn) esp_wifi_set_promiscuous(true);
-}
-
-static void configureDhcpNoGateway() {
-    // Offer an address but no router and no DNS. A phone then keeps its
-    // cellular data as the default route, so the map can still load tiles
-    // while it talks to 192.168.4.1 over Wi-Fi. (Needs field confirmation
-    // per phone model; worst case the map is blank and pins still work.)
-    esp_netif_t* ap = esp_netif_get_handle_from_ifkey("WIFI_AP_DEF");
-    if (!ap) return;
-    esp_netif_dhcps_stop(ap);
-    uint8_t none = 0;   // dhcps_offer_t: no OFFER_ROUTER, no OFFER_DNS
-    esp_netif_dhcps_option(ap, ESP_NETIF_OP_SET, ESP_NETIF_ROUTER_SOLICITATION_ADDRESS, &none, sizeof(none));
-    esp_netif_dhcps_option(ap, ESP_NETIF_OP_SET, ESP_NETIF_DOMAIN_NAME_SERVER, &none, sizeof(none));
-    esp_netif_dhcps_start(ap);
 }
 
 static void stopServers() {
@@ -681,8 +670,11 @@ static void linkStart() {
     esp_wifi_get_promiscuous(&promisc);
 
     WiFi.mode(WIFI_AP_STA);
-    IPAddress ip(AP_IP[0], AP_IP[1], AP_IP[2], AP_IP[3]);
-    WiFi.softAPConfig(ip, ip, IPAddress(255, 255, 255, 0));
+    // The core's default AP addressing (192.168.4.1, phones get .2 and up).
+    // An earlier build set the address and stripped the DHCP router/DNS
+    // options by hand; in the field an iPhone then came up holding
+    // 192.168.4.1 itself -- the board's own address -- and nothing loaded.
+    // Stock addressing is the well-trodden path.
     if (!WiFi.softAP(apSsid.c_str(), apPass.c_str(), WIFI_LINK_CHANNEL, 0, WIFI_LINK_MAX_STA)) {
         if (Serial) Serial.println("[WiFi] hotspot failed to start");
         WiFi.mode(WIFI_STA);
@@ -693,8 +685,9 @@ static void linkStart() {
     }
     // Pin the radio to the hotspot channel now, before any phone joins.
     esp_wifi_set_channel(WIFI_LINK_CHANNEL, WIFI_SECOND_CHAN_NONE);
-    configureDhcpNoGateway();
     reassertPromiscuous(promisc);
+    apAddr = WiFi.softAPIP().toString();
+    lastLeases = "";
 
     useTlsPsram();
     if (!ensureCertificates() || !startServers()) {
@@ -712,8 +705,10 @@ static void linkStart() {
     linkStartedMs = millis();
     triggerLedFlash(0, 200, 255, 800);
     playConnectionChirp();
-    if (Serial) Serial.printf("[WiFi] hotspot up: SSID %s, https://192.168.4.1/ (channel %d)\n",
-                              apSsid.c_str(), WIFI_LINK_CHANNEL);
+    if (Serial) Serial.printf("[WiFi] hotspot up: SSID %s, board address %s, https://%s/ (channel %d)\n",
+                              apSsid.c_str(), apAddr.c_str(), apAddr.c_str(), WIFI_LINK_CHANNEL);
+    if (apAddr != "192.168.4.1" && Serial)
+        Serial.println("[WiFi] WARNING: board address is not 192.168.4.1 -- the certificate will not match");
 }
 
 static void linkStop() {
@@ -739,7 +734,19 @@ static void linkStop() {
 //  Public API
 // ============================================================================
 
+// Log every address the hotspot hands out (serial + /status), so a phone that
+// joins but can't load the page can be told apart from one that got no address.
+static void onApEvent(arduino_event_id_t event, arduino_event_info_t info) {
+    if (event != ARDUINO_EVENT_WIFI_AP_STAIPASSIGNED) return;
+    String ip = IPAddress(info.wifi_ap_staipassigned.ip.addr).toString();
+    if (Serial) Serial.printf("[WiFi] phone joined, given address %s\n", ip.c_str());
+    lastLeases += (lastLeases.length() ? ", " : "") + ip;
+    if (lastLeases.length() > 120) lastLeases = lastLeases.substring(lastLeases.length() - 120);
+}
+static bool apEventHooked = false;
+
 void wifiLinkInit() {
+    if (!apEventHooked) { WiFi.onEvent(onApEvent); apEventHooked = true; }
     if (!clientMutex) clientMutex = xSemaphoreCreateMutex();
     if (!sendMutex) sendMutex = xSemaphoreCreateMutex();
     if (!rxMutex) rxMutex = xSemaphoreCreateMutex();
@@ -777,6 +784,8 @@ void wifiLinkConfigJson(JsonDocument& doc) {
     doc["wifi_ssid"] = apSsid;
     doc["wifi_pass"] = apPass;
     doc["wifi_ch"] = WIFI_LINK_CHANNEL;
+    doc["wifi_ip"] = apAddr;
+    doc["wifi_leases"] = lastLeases;
     doc["wifi_clients"] = (int)wsClientCount;
     doc["wifi_drop"] = (uint32_t)txDropped;
 }

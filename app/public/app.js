@@ -5462,7 +5462,9 @@
             if (info) {
                 info.innerHTML = 'Network <b>' + esc(deviceWifi.ssid) + '</b> · password <b>' + esc(deviceWifi.pass) + '</b><br>' +
                     (cfg.wifi
-                        ? 'On, channel ' + esc(deviceWifi.ch) + ' · ' + deviceWifi.clients + (deviceWifi.clients === 1 ? ' app' : ' apps') + ' connected over Wi‑Fi'
+                        ? 'On, channel ' + esc(deviceWifi.ch) + ' · ' + deviceWifi.clients + (deviceWifi.clients === 1 ? ' app' : ' apps') + ' connected over Wi‑Fi' +
+                          (cfg.wifi_ip ? '<br>Board address <b>' + esc(cfg.wifi_ip) + '</b>' : '') +
+                          (cfg.wifi_leases ? ' · given to phones: ' + esc(cfg.wifi_leases) : '')
                         : 'Off — full Wi‑Fi channel sweep');
             }
             if (pass && document.activeElement !== pass && !pass.value) pass.placeholder = '8–63 characters (now: ' + deviceWifi.pass + ')';
