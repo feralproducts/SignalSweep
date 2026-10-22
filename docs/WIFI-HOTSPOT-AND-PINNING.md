@@ -47,6 +47,10 @@ After that, every visit is just: join the Wi‑Fi, then open the home‑screen i
 - **Android:** step 2 is the same. Then go to Settings → Security → Encryption & credentials → Install a certificate → CA certificate, and pick the downloaded file.
 - **Factory reset** (holding BOOT for 5 s) makes the board generate a **new** certificate, and every phone has to repeat this setup.
 
+### Troubleshooting: board status page
+
+With a phone on the hotspot, open **http://192.168.4.1/status** (plain http). It shows how long the hotspot has been up, how many phones and app connections there are, free memory, and whether secure (TLS) connections are using the board's PSRAM. If the app page won't load, read these lines out; they say whether the board is short of memory or restarted.
+
 ### Will the map have street tiles over the hotspot?
 
 The board hands out an address without a "gateway", so a phone should keep using its **cellular data** for the internet (map tiles) while it talks to the board over Wi‑Fi. This behavior depends on the phone and **must be confirmed on your phones** (see the bench checklist). If tiles don't load, the app says so. Your position, the walked path, the estimate, and pins all still work, just over a blank background.

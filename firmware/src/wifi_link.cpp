@@ -25,6 +25,8 @@
 #include <mbedtls/asn1.h>
 #include <mbedtls/pem.h>
 #include <mbedtls/base64.h>
+#include <mbedtls/platform.h>
+#include <esp_system.h>
 
 #include "ble_serial.h"        // processIncomingCommand()
 #include "hardware_manager.h"  // chirps + LED flashes
@@ -86,6 +88,36 @@ static char* chainPem = NULL;   // server cert + CA cert
 static char* keyPem   = NULL;   // server private key
 static uint8_t* caDer = NULL;
 static size_t caDerLen = 0;
+
+// ============================================================================
+//  TLS memory
+// ============================================================================
+// This core is built with CONFIG_MBEDTLS_INTERNAL_MEM_ALLOC: every TLS
+// allocation comes from the chip's internal RAM. Each HTTPS connection needs
+// ~35 KB of it (16 KB in + 16 KB out record buffers, plus handshake state),
+// and a phone browser opens several connections at once to load a page. With
+// BLE, Wi-Fi and the detector also living in internal RAM, the handshakes ran
+// out of memory and the phone saw "the network connection was lost" (first
+// field test, iPhone 15, 2026-10-22). The board has 8 MB of PSRAM: send TLS
+// there, falling back to internal RAM only if PSRAM is somehow full.
+static volatile uint32_t tlsPsramFallbacks = 0;
+static void* tlsCalloc(size_t n, size_t size) {
+    void* p = heap_caps_calloc(n, size, MALLOC_CAP_SPIRAM | MALLOC_CAP_8BIT);
+    if (!p) { p = heap_caps_calloc(n, size, MALLOC_CAP_INTERNAL | MALLOC_CAP_8BIT); tlsPsramFallbacks = tlsPsramFallbacks + 1; }
+    return p;
+}
+static void tlsFree(void* p) { heap_caps_free(p); }
+static bool tlsAllocatorSet = false;
+static void useTlsPsram() {
+    if (tlsAllocatorSet) return;
+    if (heap_caps_get_total_size(MALLOC_CAP_SPIRAM) == 0) return;   // no PSRAM: leave the default
+    mbedtls_platform_set_calloc_free(tlsCalloc, tlsFree);
+    tlsAllocatorSet = true;
+}
+
+// Counters for the /status page.
+static volatile uint32_t wsOpens = 0, httpsRequests = 0;
+static uint32_t linkStartedMs = 0;
 
 // ============================================================================
 //  Certificates
@@ -429,6 +461,7 @@ void wifiLinkSend(const String& line) {
 
 static esp_err_t wsHandler(httpd_req_t* req) {
     if (req->method == HTTP_GET) {   // the upgrade handshake
+        wsOpens = wsOpens + 1;
         addClient(httpd_req_to_sockfd(req));
         return ESP_OK;
     }
@@ -472,6 +505,7 @@ static esp_err_t sendCaCert(httpd_req_t* req) {
 }
 
 static esp_err_t staticHandler(httpd_req_t* req) {
+    httpsRequests = httpsRequests + 1;
     if (strncmp(req->uri, "/ca.crt", 7) == 0) return sendCaCert(req);
     const WebAsset* a = findAsset(req->uri);
     if (!a) return httpd_resp_send_err(req, HTTPD_404_NOT_FOUND, "not found");
@@ -514,10 +548,40 @@ static const char SETUP_PAGE[] =
 "<li><b>Android:</b> Settings &rarr; Security &rarr; Encryption &amp; credentials &rarr; Install a certificate "
 "&rarr; CA certificate, and pick the downloaded file.</li>"
 "<li><b>Mac/PC:</b> open the file and mark it trusted (Keychain Access on a Mac).</li></ol>"
-"<small>Each board has its own certificate. A factory reset makes a new one.</small>"
+"<small>Each board has its own certificate. A factory reset makes a new one. "
+"Trouble? <a href='/status' style='color:#8b949e'>Board status</a></small>"
 "</body></html>";
 
+// Plain-text health readout at http://192.168.4.1/status -- readable from any
+// phone on the hotspot, so a field problem can be diagnosed without a laptop.
+static esp_err_t sendStatus(httpd_req_t* req) {
+    char b[700];
+    int n = snprintf(b, sizeof(b),
+        "SignalSweep hotspot status\n"
+        "ssid: %s  channel: %d\n"
+        "hotspot up for: %lu s   board up for: %lu s   last reset reason: %d\n"
+        "phones joined: %d   app connections (websocket): %d   websocket opens: %lu\n"
+        "https requests served: %lu   https server running: %s\n"
+        "internal RAM free: %u (lowest %u, largest block %u)\n"
+        "PSRAM free: %u of %u\n"
+        "TLS memory in PSRAM: %s   fallbacks to internal: %lu\n"
+        "lines dropped (slow phone): %lu\n",
+        apSsid.c_str(), WIFI_LINK_CHANNEL,
+        (unsigned long)((millis() - linkStartedMs) / 1000), (unsigned long)(millis() / 1000), (int)esp_reset_reason(),
+        WiFi.softAPgetStationNum(), (int)wsClientCount, (unsigned long)wsOpens,
+        (unsigned long)httpsRequests, httpsServer ? "yes" : "NO",
+        (unsigned)heap_caps_get_free_size(MALLOC_CAP_INTERNAL), (unsigned)heap_caps_get_minimum_free_size(MALLOC_CAP_INTERNAL),
+        (unsigned)heap_caps_get_largest_free_block(MALLOC_CAP_INTERNAL),
+        (unsigned)heap_caps_get_free_size(MALLOC_CAP_SPIRAM), (unsigned)heap_caps_get_total_size(MALLOC_CAP_SPIRAM),
+        tlsAllocatorSet ? "yes" : "NO", (unsigned long)tlsPsramFallbacks,
+        (unsigned long)txDropped);
+    httpd_resp_set_type(req, "text/plain; charset=utf-8");
+    httpd_resp_set_hdr(req, "Cache-Control", "no-store");
+    return httpd_resp_send(req, b, n > 0 && n < (int)sizeof(b) ? n : (int)strlen(b));
+}
+
 static esp_err_t setupHandler(httpd_req_t* req) {
+    if (strncmp(req->uri, "/status", 7) == 0) return sendStatus(req);
     if (strncmp(req->uri, "/ca.crt", 7) == 0) return sendCaCert(req);
     httpd_resp_set_type(req, "text/html");
     httpd_resp_set_hdr(req, "Cache-Control", "no-cache");
@@ -570,7 +634,7 @@ static bool startServers() {
     sc.httpd.max_uri_handlers = 4;
     sc.httpd.lru_purge_enable = true;
     sc.httpd.uri_match_fn = httpd_uri_match_wildcard;
-    sc.httpd.stack_size = 12288;
+    sc.httpd.stack_size = 16384;   // TLS handshake + ECDSA on this task
     if (httpd_ssl_start(&httpsServer, &sc) != ESP_OK) { httpsServer = NULL; return false; }
 
     httpd_uri_t ws = {};
@@ -621,6 +685,7 @@ static void linkStart() {
     configureDhcpNoGateway();
     reassertPromiscuous(promisc);
 
+    useTlsPsram();
     if (!ensureCertificates() || !startServers()) {
         if (Serial) Serial.println("[WiFi] certificate or server start failed");
         stopServers();
@@ -633,6 +698,7 @@ static void linkStart() {
     }
     linkUp = true;
     idleSinceMs = millis();
+    linkStartedMs = millis();
     triggerLedFlash(0, 200, 255, 800);
     playConnectionChirp();
     if (Serial) Serial.printf("[WiFi] hotspot up: SSID %s, https://192.168.4.1/ (channel %d)\n",
