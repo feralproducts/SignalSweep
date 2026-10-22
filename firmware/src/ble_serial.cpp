@@ -17,6 +17,7 @@
 #include <esp_random.h>
 #include <esp_system.h>
 #include "hardware_manager.h"
+#include "wifi_link.h"
 
 
 // Declared rather than included: NimBLE-Arduino ships host/ble_hs_id.h inside
@@ -245,6 +246,8 @@ String getBleConfigJson() {
     // getIgnoreJson() adds the "ignore" key itself, and only on success -- a
     // timed-out lock must leave it absent, never an authoritative empty list.
     getIgnoreJson(doc);
+    // Wi-Fi hotspot state (wifi_link.h). Absent on boards without the link.
+    wifiLinkConfigJson(doc);
     if (ignoreFullOnce) { doc["ignore_full"] = true; ignoreFullOnce = false; }
     String out;
     serializeJson(doc, out);
@@ -833,6 +836,21 @@ void processIncomingCommand(const String& rawCommand) {
         }
 #endif
 
+        // 2f. Wi-Fi hotspot (wifi_link.h): {"wifi":true|false} turns the
+        // board's own hotspot on/off, so a phone with Bluetooth can bring it
+        // up for teammates on iPhones. Deferred to loop() -- bringing a radio
+        // interface and two servers up is no job for the NimBLE host task --
+        // which answers with a fresh config once it has actually happened.
+        // {"wifi_pass":"..."} (8-63 chars) sets the WPA2 password.
+        if (doc["wifi"].is<bool>()) {
+            wifiLinkRequest(doc["wifi"].as<bool>());
+        }
+        if (doc["wifi_pass"].is<const char*>()) {
+            if (!wifiLinkSetPassword(String(doc["wifi_pass"].as<const char*>())))
+                sendReply("{\"wifi_err\":\"password must be 8-63 characters\"}");
+            sendConfigReply();
+        }
+
         // 3. Hunt: {"hunt":"AA:BB:CC:DD:EE:FF"} locks the Geiger clicker onto
         // one MAC so you can walk it down; {"hunt":null} clears. This is the
         // only firmware behaviour the app can change — detection itself keeps
@@ -1188,6 +1206,11 @@ static bool notifyChunk(uint16_t conn, uint16_t attr, const uint8_t* p, size_t n
 }
 
 void sendBleSerial(const String& data) {
+    // Every message bound for the app also goes to Wi-Fi clients. Here, ahead
+    // of the BLE early-returns, so a board reached only over its hotspot still
+    // gets every push and reply. Non-blocking: it only queues.
+    wifiLinkSend(data);
+
     if (pTxCharacteristic == nullptr) return;
 
     // Nobody subscribed: skip the whole chunk-and-notify loop. Notifying an

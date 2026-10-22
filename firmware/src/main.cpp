@@ -12,6 +12,7 @@
 #include "alert_log.h"
 #include "sd_store.h"
 #include "crash_report.h"
+#include "wifi_link.h"
 #if CONFIG_IDF_TARGET_ESP32C5
 #include <esp_task_wdt.h>
 #endif
@@ -83,6 +84,11 @@ void setup() {
     // 2. Persist hardware tier and start the always-on detector.
     modeManagerInit();
 
+    // 3. Wi-Fi hotspot link (wifi_link.h): settings only. The hotspot itself
+    // never comes up at boot -- it costs Wi-Fi channel coverage, so it is a
+    // deliberate act (BOOT double-tap, or the app).
+    wifiLinkInit();
+
 #if CONFIG_IDF_TARGET_ESP32C5
     // A C5 hung at the end of a capture (2026-10-14): no output, USB not even
     // read, dead until power was pulled -- the core's TWDT watches no task of
@@ -139,6 +145,12 @@ void loop() {
 
     static uint32_t pressStartMs = 0;
     static uint32_t lastWarnSec = 0;
+    // Double-tap detection: a first short tap is held back this long to see
+    // whether a second follows. One tap = advertising window (as before, just
+    // ~0.5 s later); two taps = Wi-Fi hotspot on/off.
+    static const uint32_t DOUBLE_TAP_MS = 500;
+    static uint32_t tapPendingMs = 0;
+    static bool tapPending = false;
 
     if (digitalRead(BOOT_BUTTON_PIN) == LOW) {
         if (pressStartMs == 0) {
@@ -165,10 +177,25 @@ void loop() {
         // at 1 s so an aborted factory-reset hold isn't read as a tap, and it
         // never touches the long-press path above. No-op when already
         // advertising.
-        if (heldMs < 1000) openAdvertisingWindow();
+        if (heldMs < 1000) {
+            if (tapPending && millis() - tapPendingMs <= DOUBLE_TAP_MS) {
+                tapPending = false;
+                wifiLinkToggle();
+            } else {
+                tapPending = true;
+                tapPendingMs = millis();
+            }
+        }
+    }
+    if (tapPending && millis() - tapPendingMs > DOUBLE_TAP_MS) {
+        tapPending = false;
+        openAdvertisingWindow();
     }
 
     bleSerialTick();
+
+    // Wi-Fi hotspot: apply on/off requests, run WebSocket clients' commands.
+    wifiLinkTick();
 
     // Resume the detector after a capture ends. The capture task deletes itself,
     // so it can't restart the detector from inside; it flags this instead.

@@ -3,6 +3,7 @@
 
 #include "mode_watchers_watch.h"
 #include "ble_serial.h"
+#include "wifi_link.h"
 #include <NimBLEDevice.h>
 #include <NimBLEScan.h>
 #include <NimBLEAdvertisedDevice.h>
@@ -1670,6 +1671,11 @@ static void watchersWifiChannelHopperTask(void *pvParameters) {
         vTaskDelay(pdMS_TO_TICKS(150));
 #endif
         if (!watchersRunning) break;
+        // Wi-Fi hotspot up (wifi_link.h): the radio belongs to the hotspot's
+        // channel and must not be moved -- a channel change drops every phone
+        // connected to it. Detection carries on, on that one channel; BLE is
+        // unaffected. Nothing to set: the AP already holds the channel.
+        if (wifiLinkParkChannel() > 0) continue;
         // A drone beacons on one fixed channel, so a channel that just carried
         // Remote ID earns one extra dwell before moving on -- never two in a
         // row, or a drone overhead would park the hopper and blind the rest.
@@ -2887,9 +2893,10 @@ void startWatchersWatch() {
     // bleScanStart() sets setMaxResults(0) and, on the S3, scans in rounds.
     bleScanStart();
     
-    // Start WiFi Promiscuous
-    WiFi.mode(WIFI_STA);
-    WiFi.disconnect();
+    // Start WiFi Promiscuous. Keep the AP half if the hotspot is up: a
+    // detector restart (e.g. after a capture) must not drop connected phones.
+    WiFi.mode(wifiLinkActive() ? WIFI_AP_STA : WIFI_STA);
+    WiFi.disconnect();   // the STA half only; never associated anyway
 #if CONFIG_IDF_TARGET_ESP32C5
     // A failed enable here silently degrades the board to 2.4 GHz-only while it
     // keeps reporting band 0 -- and it's headless, so this is the only witness.

@@ -956,6 +956,30 @@
         @keyframes eggblink { 50% { opacity: 0; } }
         #egg-scenes { display: grid; grid-template-columns: repeat(3, 1fr); gap: 8px; }
         #egg-scenes .radio-tab { min-height: 44px; }
+        /* Hunt locator + pins */
+        .fox-loc { font-size:0.85rem; line-height:1.45; color:var(--ss-text); margin:0 0 0.7rem; min-height:1.4em; }
+        .fox-hint { color:var(--ss-text-muted); }
+        .fox-q { display:inline-block; font-size:0.7rem; padding:1px 6px; border-radius:6px; margin-left:4px;
+                 border:1px solid currentColor; text-transform:uppercase; letter-spacing:0.04em; }
+        .fox-q-good { color:var(--ss-live); }
+        .fox-q-fair { color:var(--accent-amber); }
+        .fox-q-rough { color:var(--ss-dim); }
+        .fox-found { font-weight:600; }
+        .scope-act:disabled { opacity:0.45; cursor:default; }
+        .ss-pin { background:none; border:none; }
+        #pinsheet-body .ps-title { font-size:1.1rem; font-weight:700; margin:4px 30px 2px 0; }
+        #pinsheet-body .ps-sub { font-size:0.8rem; color:var(--ss-text-muted); margin-bottom:10px; word-break:break-all; }
+        #pinsheet-body .ps-badge { display:inline-block; font-size:0.8rem; padding:3px 8px; border-radius:8px; margin-bottom:10px;
+                                   border:1px solid currentColor; }
+        #pinsheet-body .ps-badge.found { color:var(--ss-live); }
+        #pinsheet-body .ps-badge.est { color:var(--accent-amber); }
+        #pinsheet-body .ps-row { display:flex; align-items:center; gap:8px; padding:8px 0; border-top:1px solid rgba(140,170,210,0.15); }
+        #pinsheet-body .ps-k { flex:none; width:4.8rem; font-size:0.75rem; color:var(--ss-text-muted); text-transform:uppercase; letter-spacing:0.04em; }
+        #pinsheet-body .ps-v { flex:1; min-width:0; font-family:ui-monospace, Consolas, monospace; font-size:0.9rem; user-select:all; }
+        #pinsheet-body .ps-actions { display:grid; grid-template-columns:1fr 1fr; gap:8px; margin-top:12px; }
+        #pinsheet-body .ps-actions .ctrl-btn { text-align:center; text-decoration:none; }
+        .set-steps { padding-left:1.2rem; }
+        .set-steps li { margin-bottom:0.4rem; }
     </style>
 
     <div class="container">
@@ -1053,7 +1077,15 @@
                 <span class="fox-trend" id="fox-trend"></span>
             </div>
             <canvas class="fox-trace" id="fox-trace"></canvas>
+            <!-- Locator: where the device probably is, from signal strength at
+                 the places you have walked (locate.js), and the two pins. -->
+            <div class="fox-loc" id="fox-loc-read" aria-live="polite"></div>
             <div class="fox-actions">
+                <button class="scope-act fox-found" onclick="pinFound()"><svg class="ico" aria-hidden="true"><use href="#i-pin"/></svg> Found it &mdash; pin here</button>
+                <button class="scope-act" id="fox-pin-est" onclick="pinEstimate()" disabled>Pin estimate</button>
+            </div>
+            <div class="fox-actions" style="margin-top:8px">
+                <button class="scope-act" onclick="showHuntMap()">Map</button>
                 <button class="scope-act" id="fox-ring" hidden onclick="ringTarget(currentHuntMac())">Make it ring</button>
                 <button class="scope-act hunting" onclick="stopHunt()">Stop hunting</button>
             </div>
@@ -1184,6 +1216,11 @@
                 <button class="set-idx" data-set="emissions">
                     <span class="set-idx-i"><svg class="ico" aria-hidden="true"><use href="#i-mute"/></svg></span>
                     <span class="set-idx-t">Emissions<em>Receive&#8209;only: stop announcing itself</em></span>
+                    <span class="set-idx-c">&rsaquo;</span>
+                </button>
+                <button class="set-idx" data-set="wifi">
+                    <span class="set-idx-i"><svg class="ico" aria-hidden="true" viewBox="0 0 24 24" style="fill:none;stroke:currentColor;stroke-width:2;stroke-linecap:round"><path d="M2 8.5a15 15 0 0 1 20 0M5 12a10 10 0 0 1 14 0M8.5 15.5a5 5 0 0 1 7 0"/><circle cx="12" cy="19" r="1.2"/></svg></span>
+                    <span class="set-idx-t">Wi&#8209;Fi hotspot<em>For iPhones and browsers without Bluetooth</em></span>
                     <span class="set-idx-c">&rsaquo;</span>
                 </button>
                 <button class="set-idx" data-set="device">
@@ -1374,6 +1411,29 @@
                 </div>
                 </section>
 
+                <section class="set-page" id="setp-wifi" data-title="Wi-Fi hotspot" hidden>
+                <h3 class="set-label">Wi&#8209;Fi hotspot</h3>
+                <p class="set-note">
+                    Lets iPhones, iPads and any browser without Bluetooth use this app: the board becomes a Wi&#8209;Fi hotspot and serves the app itself. <strong>While it is on, Wi&#8209;Fi detection watches only one channel</strong> (channel 6); Bluetooth detection is unaffected. It turns itself off after 10 minutes with nobody connected. <strong>Double&#8209;tap BOOT</strong> on the board to toggle it without the app.
+                </p>
+                <div class="set-row">
+                    <span>Hotspot</span>
+                    <button class="set-toggle off" id="btn-wifi" onclick="toggleWifiHotspot()" disabled>&mdash;</button>
+                </div>
+                <p class="set-note" id="wifi-info">Connect the board to see the hotspot.</p>
+                <h3 class="set-label">Hotspot password</h3>
+                <p class="set-note">The default is <code>signalsweep</code>. Change it before taking the board into the field.</p>
+                <input class="set-text" id="cfg-wifipass" type="text" maxlength="63" autocomplete="off" placeholder="8&ndash;63 characters">
+                <button class="ctrl-btn" style="width:100%;" onclick="saveWifiPass()">Save password</button>
+                <h3 class="set-label">Connecting an iPhone or iPad</h3>
+                <ol class="set-note set-steps">
+                    <li>Turn the hotspot on (here, or double&#8209;tap BOOT &mdash; the light flashes blue).</li>
+                    <li>On the iPhone: <b>Settings &rarr; Wi&#8209;Fi</b>, join the network above with its password.</li>
+                    <li><b>First time only:</b> open <b>http://192.168.4.1</b> in Safari, tap <b>Download certificate</b>, and install it (<b>Settings &rarr; Profile Downloaded &rarr; Install</b>, then <b>General &rarr; About &rarr; Certificate Trust Settings</b> &rarr; turn it on).</li>
+                    <li>Open <b>https://192.168.4.1</b>. It connects by itself. Add it to the home screen for one&#8209;tap access.</li>
+                </ol>
+                </section>
+
                 <section class="set-page" id="setp-device" data-title="Device identity" hidden>
                 <h3 class="set-label">Device identity</h3>
                 <p class="set-note">
@@ -1444,12 +1504,12 @@
                 <p>Over the air or down a cable. Your pick.</p>
             </div>
             <div class="modal-actions">
-                <button class="btn-conn-option primary" onclick="connectWebBluetooth()">
+                <button class="btn-conn-option primary" id="btnConnBle" onclick="connectWebBluetooth()">
                     <div class="btn-left">
                         <svg viewBox="0 0 24 24"><path d="M6.5 6.5l11 11M12 2v20l5.5-5.5L12 11l5.5-5.5L12 2z"/></svg>
                         <div style="text-align:left;">
                             <div>Connect via Bluetooth</div>
-                            <div style="font-size:0.75rem;font-weight:normal;opacity:0.8;">Nordic UART Service (NUS)</div>
+                            <div style="font-size:0.75rem;font-weight:normal;opacity:0.8;" id="connBleSub">Nordic UART Service (NUS)</div>
                         </div>
                     </div>
                     <span class="btn-arrow">&rarr;</span>
@@ -1464,10 +1524,21 @@
                     </div>
                     <span class="btn-arrow">&rarr;</span>
                 </button>
+                <button class="btn-conn-option" id="btnConnWifi" onclick="connectWifiButton()">
+                    <div class="btn-left">
+                        <svg viewBox="0 0 24 24"><path d="M2 8.5a15 15 0 0 1 20 0M5 12a10 10 0 0 1 14 0M8.5 15.5a5 5 0 0 1 7 0"/><circle cx="12" cy="19" r="1.2"/></svg>
+                        <div style="text-align:left;">
+                            <div>Connect via the board&rsquo;s Wi&#8209;Fi</div>
+                            <div style="font-size:0.75rem;font-weight:normal;opacity:0.8;">iPhone, iPad, Safari, Firefox &mdash; any browser</div>
+                        </div>
+                    </div>
+                    <span class="btn-arrow">&rarr;</span>
+                </button>
             </div>
             <div class="api-support-info">
                 <div class="api-badge-row"><span>Bluetooth:</span><span class="api-badge" id="bleSupportBadge">Checking...</span></div>
                 <div class="api-badge-row"><span>USB serial:</span><span class="api-badge" id="serialSupportBadge">Checking...</span></div>
+                <div class="api-badge-row"><span>Wi&#8209;Fi hotspot:</span><span class="api-badge" id="wifiSupportBadge">Checking...</span></div>
                 <!-- Troubleshooting, not instructions: it sits under the two
                      choices rather than between them, because it is read once
                      and then in the way of the button you came here to press.
@@ -1510,6 +1581,28 @@
             <div id="pin-error" style="color:var(--accent-red);font-size:0.8rem;text-align:center;min-height:1em;"></div>
             <div class="modal-actions"><button class="ctrl-btn on" id="pin-gate-submit" onclick="submitPin()">Unlock</button></div>
             <p style="font-size:0.75rem;color:var(--text-muted);text-align:center;margin-top:0.5rem;">Detecting and beeping never needs a PIN. This only protects your recorded pins. Forget it and the pins are unrecoverable — by design.</p>
+        </div>
+    </div>
+
+    <!-- One pin, every way a team might want it: decimal, DMS, MGRS, a map link. -->
+    <div class="modal-overlay" id="pinsheet-modal">
+        <div class="modal-card">
+            <button class="modal-close-btn" onclick="closePinSheet()">&times;</button>
+            <div id="pinsheet-body"></div>
+        </div>
+    </div>
+
+    <!-- Shown when the Wi-Fi link cannot reach the board from here. -->
+    <div class="modal-overlay" id="wifi-help-modal">
+        <div class="modal-card">
+            <button class="modal-close-btn" onclick="closeWifiHelp()">&times;</button>
+            <div class="modal-header"><h2>Reach the board over Wi&#8209;Fi</h2><p>Couldn&rsquo;t reach it from here. Three steps:</p></div>
+            <ol class="set-note set-steps">
+                <li><b>Turn on its hotspot:</b> double&#8209;tap the BOOT button (the light flashes blue), or turn it on from a phone connected over Bluetooth (Settings &rarr; Wi&#8209;Fi hotspot).</li>
+                <li><b>Join its Wi&#8209;Fi:</b> the network is named <b>SignalSweep&#8209;XXXX</b>. The default password is <code>signalsweep</code>.</li>
+                <li><b>Open <a href="https://192.168.4.1/">https://192.168.4.1</a></b>. On a phone&rsquo;s first visit, open <a href="http://192.168.4.1/">http://192.168.4.1</a> first and install the board&rsquo;s certificate &mdash; the page walks you through it.</li>
+            </ol>
+            <div class="modal-actions"><a class="ctrl-btn on" style="text-align:center" href="https://192.168.4.1/">Open https://192.168.4.1</a></div>
         </div>
     </div>
 
@@ -1586,6 +1679,7 @@
     <!-- Toast -->
     <div id="toast"><span id="toast-icon">✓</span><span id="toast-msg"></span></div>
 
+    <script defer src="/locate.js"></script>
     <script defer src="/app.js"></script>
 </body>
 </html>

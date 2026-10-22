@@ -50,6 +50,7 @@
 #include "sd_store.h"
 #include "host_time.h"
 #include "ble_serial.h"
+#include "wifi_link.h"
 
 static const char* TAG = "Capture";
 
@@ -353,6 +354,13 @@ static void startCapture(uint32_t durationSecs, bool toSd) {
     // flushing/closing its SD stream and freeing its rings is a use-after-free.
     if (capturing || drainTaskHandle != NULL) return;
 
+    // A capture sweeps every channel and the hotspot pins the radio to one;
+    // and the capture would knock a Wi-Fi-connected phone off mid-stream.
+    // Say so rather than silently breaking one or the other.
+    if (wifiLinkActive()) {
+        capReply("{\"cap\":{\"error\":\"turn off the Wi-Fi hotspot first\"}}");
+        return;
+    }
     capToSd = toSd;
     capSdError = NULL;
     sdBufLen = 0;

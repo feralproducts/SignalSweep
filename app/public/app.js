@@ -14,7 +14,7 @@
         const BLE_WRITE_CHUNK  = 180;   // bytes per BLE write; see sendCommandNow()
         const NUS_TX_UUID      = '6e400003-b5a3-f393-e0a9-e50e24dcca9e';
 
-        let connectionType = null; // 'BLE' | 'SERIAL' | null
+        let connectionType = null; // 'BLE' | 'SERIAL' | 'USB' | 'WIFI' | null
 
         function esc(v) {
             if (v == null) return '';
@@ -219,6 +219,10 @@
                     ridStatus: t.rid_status, euCat: t.eu_cat, euClass: t.eu_class,
                     opLoc: t.op_loc
                 };
+                // Smooth only fresh readings: the board repeats a device's last
+                // RSSI for up to 30 s after it last heard it, and feeding those
+                // repeats in would pin the filter to a stale value.
+                if ((Number(t.age) || 0) < 2) smoothRssi(t.mac, t.rssi, now);
                 maybeOfferRecord(liveMatches[t.mac]);
             }
         }
@@ -265,6 +269,7 @@
             });
             if (name !== 'settings') showSetting(null);
             window.scrollTo(0, 0);
+            updateGeoWatch();
             // Survey's two lists are built on demand; Sweep repaints itself on
             // the next push, and the map needs its size recomputed after being
             // display:none (Leaflet measures a hidden container as 0x0).
@@ -357,6 +362,7 @@
             if (list) list.style.display = (viewMode === 'map') ? 'none' : 'block';
             if (btn)  btn.textContent = (viewMode === 'map') ? '\u2630 List' : 'Map';
             if (viewMode === 'map') initMap();
+            updateGeoWatch();
             renderScope();
         }
 
@@ -859,17 +865,18 @@
         // memory, cleared when the hunt stops or the link drops. It is a signal
         // trace, not a track -- there is no position in it.
         let huntTrace = [];
-        const HUNT_TRACE_MAX = 40;
+        const HUNT_TRACE_MAX = 80;   // ~20 s at the 4 Hz hunt frame
 
         function currentHuntMac() { return huntMac; }
 
         // Only append when the sample is actually new, so standing still doesn't
         // fill the trace with duplicates of one reading. Fed by both the 1 Hz
         // push and the 4 Hz hunt frame.
-        function pushHuntSample(rssi, ts) {
+        function pushHuntSample(rssi, ts, sm) {
             const last = huntTrace.length ? huntTrace[huntTrace.length - 1] : null;
             if (last && last.ts === ts) return;
-            huntTrace.push({ rssi: Number(rssi), ts: ts });
+            if (sm == null) { const v = huntSmoothed(); sm = v == null ? Number(rssi) : v; }
+            huntTrace.push({ rssi: Number(rssi), sm: Number(sm), ts: ts });
             if (huntTrace.length > HUNT_TRACE_MAX) huntTrace.shift();
         }
 
@@ -915,6 +922,8 @@
             if (same) { stopHunt(); return; }
             huntMac = String(mac);
             huntTrace = [];
+            resetHuntLocate();
+            updateGeoWatch();   // the locator needs your position while hunting
             sendCommand({ hunt: huntMac });
             showToast('Locked on \u2014 follow the beeps', '\u25c9');
             renderScope();
@@ -949,6 +958,8 @@
         function stopHunt() {
             huntMac = '';
             huntTrace = [];
+            resetHuntLocate();
+            updateGeoWatch();
             sendCommand({ hunt: '' });   // "" clears; see ble_serial.cpp
             showToast('Hunt stopped', '\u25cb');
             renderScope();
@@ -983,12 +994,16 @@
                 if (rssiEl)  rssiEl.textContent = '--';
                 if (trendEl) { trendEl.textContent = 'no signal'; trendEl.style.color = 'var(--ss-dim)'; }
                 drawTrace();
+                paintHuntLocate();
                 return;
             }
 
             const cat = categoryOf(m.type || m.rule);
             if (nameEl) nameEl.textContent = m.name || m.rule || cat.label;
-            if (rssiEl) rssiEl.textContent = m.rssi;
+            // The smoothed level, not the raw reading: raw RSSI jumps +/-5 dB
+            // from reflections alone, which made the big number unreadable.
+            const smv = huntSmoothed();
+            if (rssiEl) rssiEl.textContent = smv == null ? m.rssi : Math.round(smv);
 
             pushHuntSample(m.rssi, m.ts);
 
@@ -996,7 +1011,7 @@
             // before them. 3 dB is roughly the smallest change worth acting on;
             // below that the reading is just multipath noise.
             if (trendEl) {
-                const t = huntTrace.map(function (p) { return p.rssi; });
+                const t = huntTrace.map(function (p) { return p.sm; });
                 if (t.length < 4) {
                     trendEl.textContent = 'reading\u2026';
                     trendEl.style.color = 'var(--ss-dim)';
@@ -1006,13 +1021,16 @@
                     // hunt frame's 4 Hz that is ~1.5 s of history; the old
                     // 4-against-6 window was ~10 s at 1 Hz, which is why the
                     // screen read cold while the buzzer was already warming.
-                    const delta = avg(t.slice(-3)) - avg(t.slice(-6, -3));
-                    if (delta > 3)       { trendEl.textContent = 'warmer';  trendEl.style.color = 'var(--ss-live)'; }
-                    else if (delta < -3) { trendEl.textContent = 'colder';  trendEl.style.color = 'var(--accent-amber)'; }
+                    // Smoothed values: 2 dB of filtered change is a real trend,
+                    // where it took 3 dB of raw change to beat the noise.
+                    const delta = avg(t.slice(-3)) - avg(t.slice(-8, -5));
+                    if (delta > 2)       { trendEl.textContent = 'warmer';  trendEl.style.color = 'var(--ss-live)'; }
+                    else if (delta < -2) { trendEl.textContent = 'colder';  trendEl.style.color = 'var(--accent-amber)'; }
                     else                 { trendEl.textContent = 'holding'; trendEl.style.color = 'var(--ss-dim)'; }
                 }
             }
             drawTrace();
+            paintHuntLocate();
         }
 
         function drawTrace() {
@@ -1039,13 +1057,27 @@
             const y = (r) => h - 2 - rssiFrac(r) * (h - 4);
             const x0 = w - (huntTrace.length - 1) * step;
 
+            // Raw readings, faint: the scatter is information (a wide band
+            // means reflections), but it is not the level.
             ctx.beginPath();
             huntTrace.forEach(function (p, i) {
                 const x = x0 + i * step;
                 if (i === 0) ctx.moveTo(x, y(p.rssi)); else ctx.lineTo(x, y(p.rssi));
             });
             ctx.strokeStyle = cssColor('var(--ss-cat-tracker)');
-            ctx.lineWidth = 2;
+            ctx.globalAlpha = 0.3;
+            ctx.lineWidth = 1;
+            ctx.stroke();
+            ctx.globalAlpha = 1;
+
+            // The smoothed level, bold: this is the line to follow.
+            ctx.beginPath();
+            huntTrace.forEach(function (p, i) {
+                const x = x0 + i * step;
+                if (i === 0) ctx.moveTo(x, y(p.sm)); else ctx.lineTo(x, y(p.sm));
+            });
+            ctx.strokeStyle = cssColor('var(--ss-cat-tracker)');
+            ctx.lineWidth = 2.5;
             ctx.lineJoin = 'round';
             ctx.stroke();
 
@@ -1124,35 +1156,38 @@
         });
 
         // =====================================================================
-        //  Live map. Live ONLY.
+        //  Live map + hunt locator
         // =====================================================================
-        // The map came back; the trail it used to come with did not. Rules that
-        // hold here, and the reason each one exists:
+        // This build deliberately changes upstream's "one-shot fix only" rule,
+        // because the operator's job here is different: walk a device down and
+        // pin it so a team can go straight to it. What changed, and what didn't:
         //
-        //   * ONE-SHOT position only (getFix), never watchPosition. A passive
-        //     position watch is a location history in RAM, and a location
-        //     history is the thing this whole redesign exists to not have.
-        //   * No breadcrumb polyline. Same reason.
-        //   * No offline tile cache. Cached tiles persist on disk and record
-        //     which areas you downloaded -- a weak trail, but a real one.
-        //   * Nothing here is written to storage, and it all clears on
-        //     disconnect along with liveMatches.
+        //   * While the map is open OR a hunt is running, the phone's position
+        //     is WATCHED, so your dot moves smoothly and each hunt reading is
+        //     tied to where it was taken. The watch stops the moment neither is
+        //     true, and while the app is in the background.
+        //   * Hunt readings (position + signal) live in memory only and are
+        //     cleared when the hunt stops or the board disconnects. Nothing
+        //     touches storage except a pin you explicitly drop (encrypted, as
+        //     before).
+        //   * Still no offline tile cache.
         //
-        // What gets drawn:
-        //   * You: a small dot at your last fix.
-        //   * Drones: a solid marker at their DECODED coordinate. That number is
-        //     real -- the aircraft broadcast it.
-        //   * Everything else: a dashed circle of RSSI-estimated radius around
-        //     YOU. Deliberately not a marker, because we do not know where the
-        //     thing is; we only know roughly how far. A pin would be a lie.
-        //   * Saved pins: only once unlocked. Detecting never asks for the PIN.
-        let map = null, meLayer = null, liveLayer = null, pinLayer = null;
-        let mapFix = null;   // {lat, lng, acc} -- last one-shot fix, memory only
+        // Smoothness: layers are kept and moved, never cleared and rebuilt each
+        // second (that was the flicker), RSSI is Kalman-filtered per device
+        // (locate.js) so rings and the hunt meter stop jumping, and your dot and
+        // the rings glide to their new values instead of snapping.
+        let map = null, meLayer = null, liveLayer = null, pinLayer = null, huntLayer = null;
+        let mapFix = null;     // {lat, lng, acc, t} -- latest fix, memory only
+        let mapFollow = true;  // keep you centred until you pan the map yourself
+        let mapTilesFailing = false;
+        const mapRings = new Map();    // MAC -> { c: L.circle, r: shown radius, target }
+        const mapDrones = new Map();   // MAC -> { m: marker, op: marker|null }
+        let meDot = null, meAcc = null;
+        let meShown = null, meTarget = null;   // {lat, lng} drawn vs latest
+        let mapAnimRaf = 0;
 
         // Very rough log-distance path loss. Good enough to say "close" vs "far"
         // and nothing more, which is exactly what the dashed ring claims.
-        // ponytail: fixed exponent; add a calibration knob if it reads badly in
-        // the field, since real environments vary far more than this model does.
         function rssiMeters(rssi) {
             const r = Number(rssi);
             if (!isFinite(r)) return 100;
@@ -1160,117 +1195,467 @@
             return Math.max(5, Math.min(400, m * 10));
         }
 
+        // ---- RSSI smoothing (per device) -------------------------------------
+        const rssiSmooth = new Map();   // MAC (upper) -> SSLocate.RssiFilter
+        function smoothRssi(mac, rssi, ts) {
+            if (!window.SSLocate) return Number(rssi);
+            const k = String(mac).toUpperCase();
+            let f = rssiSmooth.get(k);
+            if (!f) { f = new window.SSLocate.RssiFilter(); rssiSmooth.set(k, f); }
+            return f.update(rssi, ts);
+        }
+        function smoothedRssi(m) {
+            const f = m && rssiSmooth.get(String(m.mac).toUpperCase());
+            const v = f ? f.value() : null;
+            return v == null ? Number(m && m.rssi) : v;
+        }
+
+        // ---- Live position ---------------------------------------------------
+        let geoWatch = null;   // token: { cap: id } | { web: id } | { pending: true }
+        function wantGeo() {
+            return !!huntMac || (currentTab === 'sweep' && viewMode === 'map');
+        }
+        function updateGeoWatch() {
+            const want = wantGeo() && !(typeof document !== 'undefined' && document.hidden);
+            if (want && !geoWatch) startGeoWatch();
+            else if (!want && geoWatch) stopGeoWatch();
+        }
+        function onGeo(c) {
+            if (!c || !isFinite(c.latitude) || !isFinite(c.longitude)) return;
+            mapFix = { lat: c.latitude, lng: c.longitude, acc: c.accuracy || 50, t: Date.now() };
+            if (gpsState.state !== 'fix' || Math.abs((gpsState.acc || 0) - mapFix.acc) >= 1) setGpsState('fix', mapFix.acc);
+            if (huntMac) addHuntSample();
+            moveMe();
+        }
+        function onGeoErr(err) {
+            const denied = err && (err.code === 1 || /denied|permission/i.test(err.message || ''));
+            setGpsState(denied ? 'denied' : 'failed');
+            if (denied) {
+                stopGeoWatch();
+                showToast('Location permission is off — the map and pins need it', 'alert');
+            }
+        }
+        function startGeoWatch() {
+            const opts = { enableHighAccuracy: true, timeout: 20000, maximumAge: 1000 };
+            const native = window.Capacitor && window.Capacitor.isNativePlatform && window.Capacitor.isNativePlatform();
+            if (native && window.Geolocation && window.Geolocation.watchPosition) {
+                const tok = { pending: true };
+                geoWatch = tok;
+                setGpsState('locating');
+                window.Geolocation.watchPosition(opts, function (pos, err) {
+                    if (geoWatch !== tok) return;
+                    if (err || !pos) { onGeoErr(err); return; }
+                    onGeo(pos.coords);
+                }).then(function (id) {
+                    if (geoWatch === tok) { tok.cap = id; tok.pending = false; }
+                    else { try { window.Geolocation.clearWatch({ id: id }); } catch (e) {} }
+                }).catch(onGeoErr);
+            } else if (typeof navigator !== 'undefined' && navigator.geolocation) {
+                setGpsState('locating');
+                const id = navigator.geolocation.watchPosition(function (p) { onGeo(p.coords); }, onGeoErr, opts);
+                geoWatch = { web: id };
+            }
+        }
+        function stopGeoWatch() {
+            const tok = geoWatch;
+            geoWatch = null;
+            if (!tok) return;
+            try {
+                if (tok.web != null) navigator.geolocation.clearWatch(tok.web);
+                else if (tok.cap != null) window.Geolocation.clearWatch({ id: tok.cap });
+            } catch (e) {}
+        }
+        if (typeof document !== 'undefined' && document.addEventListener) {
+            document.addEventListener('visibilitychange', function () { updateGeoWatch(); });
+        }
+
+        // ---- Hunt locator ----------------------------------------------------
+        // Readings for the locked target: where you were + its smoothed signal.
+        let huntSamples = [];
+        let huntEst = null;
+        let huntEstTimer = null;
+        let huntDotsDrawn = 0;
+        const HUNT_SAMPLES_MAX = 600;
+        const HUNT_FIX_MAX_AGE_MS = 5000;
+        const HUNT_FIX_MAX_ACC_M = 35;   // vaguer than ~115 ft says nothing useful
+
+        function huntSmoothed() {
+            const f = huntMac && rssiSmooth.get(huntMac.toUpperCase());
+            return f ? f.value() : null;
+        }
+        function addHuntSample() {
+            const sm = huntSmoothed();
+            if (sm == null || !mapFix) return;
+            if (Date.now() - mapFix.t > HUNT_FIX_MAX_AGE_MS || mapFix.acc > HUNT_FIX_MAX_ACC_M) return;
+            huntSamples.push({ lat: mapFix.lat, lng: mapFix.lng, acc: mapFix.acc, rssi: sm, t: Date.now() });
+            if (huntSamples.length > HUNT_SAMPLES_MAX) { huntSamples.shift(); huntDotsDrawn = Math.max(0, huntDotsDrawn - 1); }
+            scheduleEstimate();
+        }
+        function scheduleEstimate() {
+            if (huntEstTimer) return;
+            // ~30 ms of maths on a phone; every 2 s is plenty for walking pace.
+            huntEstTimer = setTimeout(function () {
+                huntEstTimer = null;
+                if (!huntMac || !window.SSLocate) return;
+                try { huntEst = window.SSLocate.estimateSource(huntSamples); } catch (e) { console.warn('estimate failed', e); huntEst = null; }
+                paintHuntLocate();
+                if (map && viewMode === 'map') renderHuntLayer();
+            }, 2000);
+        }
+        function resetHuntLocate() {
+            huntSamples = [];
+            huntEst = null;
+            huntDotsDrawn = 0;
+            if (huntEstTimer) { clearTimeout(huntEstTimer); huntEstTimer = null; }
+            if (huntLayer) huntLayer.clearLayers();
+            huntLayerParts = null;
+            paintHuntLocate();
+        }
+
+        // The words under the hunt meter. Plain language, imperial units.
+        function paintHuntLocate() {
+            const el = document.getElementById('fox-loc-read');
+            const btn = document.getElementById('fox-pin-est');
+            if (!el) return;
+            const L = window.SSLocate;
+            const est = huntEst;
+            if (btn) btn.disabled = !(est && est.ready);
+            if (!huntMac) { el.textContent = ''; return; }
+            if (gpsState.state === 'denied' || gpsState.state === 'sysoff') {
+                el.innerHTML = 'Location is off, so the app can only show signal strength. Turn location on to estimate where it is.';
+                return;
+            }
+            if (!mapFix) { el.textContent = 'Getting your location…'; return; }
+            if (mapFix.acc > HUNT_FIX_MAX_ACC_M) {
+                el.textContent = 'Your GPS is too vague right now (±' + L.fmtFeet(mapFix.acc) + '). Step into the open for a better fix.';
+                return;
+            }
+            if (!est || !est.ready) {
+                el.textContent = 'Walk around the area — readings from several directions let the app estimate where it is (' +
+                    huntSamples.length + ' so far).';
+                return;
+            }
+            const d = L.metresBetween(mapFix.lat, mapFix.lng, est.lat, est.lng);
+            const dir = L.compass(L.bearingDeg(mapFix.lat, mapFix.lng, est.lat, est.lng));
+            const q = { good: 'good', fair: 'fair', rough: 'rough' }[est.quality] || 'rough';
+            let html = '<b>Estimate: ' + (d < 6 ? 'right around you' : L.fmtFeet(d) + ' ' + dir + ' of you') +
+                '</b> · likely within ' + L.fmtFeet(est.r68) + ' <span class="fox-q fox-q-' + q + '">' + q + '</span>';
+            let hint = '';
+            if (est.edge) hint = 'It looks further ' + L.compass(est.edgeBearing) + ' than you have walked — head that way.';
+            else if (est.contrast < 8) hint = 'The signal barely changes where you have been. Walk toward it, or farther off, to get contrast.';
+            else if (est.r68 > 1.5 * est.spread) hint = 'Walk a stretch at right angles to your path to narrow it down.';
+            else if (est.quality === 'good') hint = 'Close in on the circle and use the beeps for the last few feet, then tap Found it.';
+            if (hint) html += '<br><span class="fox-hint">' + esc(hint) + '</span>';
+            el.innerHTML = html;
+        }
+
+        // ---- Map -------------------------------------------------------------
         function initMap() {
             if (map || !window.L) return;
             const el = document.getElementById('map');
             if (!el) return;
-            map = window.L.map(el, { zoomControl: true, attributionControl: true })
+            // Canvas renderer: dozens of moving circles redraw far more smoothly
+            // than one SVG node each.
+            map = window.L.map(el, { zoomControl: true, attributionControl: true, preferCanvas: true })
                     .setView([0, 0], 2);
             // Standard OSM tiles, darkened in CSS rather than a ready-made dark
             // basemap: CARTO's dark_all now returns "API KEY REQUIRED" stamped
             // across every tile, and a detector should not depend on a keyed
             // service to draw a map at all.
-            window.L.tileLayer('https://tile.openstreetmap.org/{z}/{x}/{y}.png', {
+            const tiles = window.L.tileLayer('https://tile.openstreetmap.org/{z}/{x}/{y}.png', {
                 maxZoom: 19,
                 attribution: '&copy; OpenStreetMap contributors'
             }).addTo(map);
+            // On the board's own hotspot a phone may have no internet route at
+            // all. Say so, rather than leaving a grey square that looks broken.
+            tiles.on('tileerror', function () { if (!mapTilesFailing) { mapTilesFailing = true; renderMapNote(); } });
+            tiles.on('tileload', function () { if (mapTilesFailing) { mapTilesFailing = false; renderMapNote(); } });
             meLayer   = window.L.layerGroup().addTo(map);
             liveLayer = window.L.layerGroup().addTo(map);
+            huntLayer = window.L.layerGroup().addTo(map);
             pinLayer  = window.L.layerGroup().addTo(map);
+            map.on('dragstart', function () { mapFollow = false; renderMapNote(); });
             recenterMap();
         }
 
-        async function recenterMap() {
-            try {
-                const fix = await getFix();
-                mapFix = { lat: fix.lat, lng: fix.lng, acc: fix.acc };
-                if (map) map.setView([mapFix.lat, mapFix.lng], 16);
-                renderScope();
-            } catch (e) {
-                showToast('No location fix available', '!');
+        function recenterMap() {
+            mapFollow = true;
+            updateGeoWatch();
+            if (mapFix && map) map.setView([mapFix.lat, mapFix.lng], Math.max(map.getZoom(), 17));
+            else if (!geoWatch) {
+                // No watch possible (no geolocation at all): one last try.
+                getFix().then(function (fix) {
+                    mapFix = { lat: fix.lat, lng: fix.lng, acc: fix.acc, t: Date.now() };
+                    if (map) map.setView([mapFix.lat, mapFix.lng], 17);
+                    moveMe();
+                }).catch(function () { showToast('No location fix available', '!'); });
             }
+            renderMapNote();
         }
 
-        // Permanent labels: the layers are rebuilt every push, which closes a
-        // popup within a second, so an unlabelled dot could never say what it was.
+        // Your dot glides to each new fix; the distance rings ride along with it.
+        function moveMe() {
+            if (!mapFix) return;
+            meTarget = { lat: mapFix.lat, lng: mapFix.lng };
+            if (!meShown) meShown = { lat: meTarget.lat, lng: meTarget.lng };
+            if (map && mapFollow && viewMode === 'map') {
+                const first = !meDot;
+                if (first) map.setView([meTarget.lat, meTarget.lng], Math.max(map.getZoom(), 17));
+                else if (!map.getBounds().pad(-0.25).contains([meTarget.lat, meTarget.lng])) {
+                    map.panTo([meTarget.lat, meTarget.lng], { animate: true, duration: 0.6 });
+                }
+            }
+            kickMapAnim();
+        }
+
+        function kickMapAnim() {
+            if (mapAnimRaf || !map || typeof requestAnimationFrame === 'undefined') return;
+            mapAnimRaf = requestAnimationFrame(mapAnimStep);
+        }
+        function mapAnimStep() {
+            mapAnimRaf = 0;
+            if (!map || !window.L) return;
+            let moving = false;
+            // Exponential approach: ~85% of the way in 300 ms at 60 fps.
+            const k = 0.1;
+            if (meTarget && meShown) {
+                const dLat = meTarget.lat - meShown.lat, dLng = meTarget.lng - meShown.lng;
+                if (Math.abs(dLat) > 1e-7 || Math.abs(dLng) > 1e-7) {
+                    meShown.lat += dLat * k; meShown.lng += dLng * k; moving = true;
+                } else { meShown.lat = meTarget.lat; meShown.lng = meTarget.lng; }
+                const live = cssColor('var(--ss-live)');
+                const ll = [meShown.lat, meShown.lng];
+                if (!meDot) {
+                    meAcc = window.L.circle(ll, { radius: mapFix ? mapFix.acc : 10, color: live, weight: 1, opacity: 0.35,
+                                                  fillColor: live, fillOpacity: 0.06, interactive: false }).addTo(meLayer);
+                    meDot = window.L.circleMarker(ll, { radius: 7, color: '#fff', weight: 2, fillColor: live, fillOpacity: 1 })
+                                .addTo(meLayer).bindTooltip('You', MAP_LABEL);
+                } else {
+                    meDot.setLatLng(ll);
+                    meAcc.setLatLng(ll);
+                    if (mapFix) meAcc.setRadius(mapFix.acc);
+                }
+            }
+            mapRings.forEach(function (r) {
+                if (meShown) r.c.setLatLng([meShown.lat, meShown.lng]);
+                const d = r.target - r.r;
+                if (Math.abs(d) > 0.3) { r.r += d * k; moving = true; } else r.r = r.target;
+                r.c.setRadius(r.r);
+            });
+            if (moving) mapAnimRaf = requestAnimationFrame(mapAnimStep);
+        }
+
+        // Permanent labels: a dot on a moving map must say what it is without a tap.
         const MAP_LABEL = { permanent: true, direction: 'right', offset: [8, 0], className: 'map-label' };
+
+        function ringPopup(mac) {
+            const m = liveMatches[mac] || liveMatches[Object.keys(liveMatches).find(function (k) { return k.toUpperCase() === mac; })];
+            if (!m) return 'Gone';
+            const cat = categoryOf(m.type || m.rule);
+            const L = window.SSLocate;
+            return ico(cat.icon) + ' ' + esc(m.name || m.rule || cat.label) + '<br>' + esc(m.mac) +
+                '<br>within ~' + (L ? L.fmtFeet(rssiMeters(smoothedRssi(m))) : Math.round(rssiMeters(smoothedRssi(m))) + ' m') +
+                ' (signal strength only)' +
+                '<br><button class="scope-act" onclick="huntTarget(\'' + esc(m.mac) + '\')">◎ Hunt</button>';
+        }
 
         function renderMap(rows) {
             if (!map || !window.L) return;
-            const live = cssColor('var(--ss-live)');
-            meLayer.clearLayers();
-            liveLayer.clearLayers();
-
-            if (mapFix) {
-                window.L.circleMarker([mapFix.lat, mapFix.lng], {
-                    radius: 6, color: live, fillColor: live, fillOpacity: 0.9, weight: 2
-                }).addTo(meLayer).bindPopup('You').bindTooltip('You', MAP_LABEL);
-                if (mapFix.acc) {
-                    window.L.circle([mapFix.lat, mapFix.lng], {
-                        radius: mapFix.acc, color: live, weight: 1, opacity: 0.3, fill: false
-                    }).addTo(meLayer);
-                }
-            }
-
-            let ringed = 0;
+            moveMe();
+            const seen = new Set();
             for (const m of rows) {
+                const key = String(m.mac).toUpperCase();
                 const cat = categoryOf(m.type || m.rule);
-                const color = cssColor(cat.color);   // Leaflet writes SVG attributes: no var()
+                const color = cssColor(cat.color);   // Leaflet canvas/SVG: no var()
                 const title = esc(m.name || m.rule || cat.label);
                 const label = ico(cat.icon) + ' ' + title;
+                const hunted = !!huntMac && huntMac.toUpperCase() === key;
                 if (m.lat != null && m.lng != null) {
-                    // A real, broadcast coordinate: it gets a real marker.
-                    window.L.circleMarker([m.lat, m.lng], {
-                        radius: 8, color: color, fillColor: color, fillOpacity: 0.85, weight: 2
-                    }).addTo(liveLayer).bindPopup(ico(cat.icon) + ' ' + title + '<br>' + esc(m.mac))
-                      .bindTooltip(label, MAP_LABEL);
+                    // A real, broadcast coordinate (Remote ID): a real marker.
+                    seen.add('d' + key);
+                    let d = mapDrones.get(key);
+                    if (!d) {
+                        d = { m: window.L.circleMarker([m.lat, m.lng], { radius: 8, color: color, fillColor: color, fillOpacity: 0.85, weight: 2 })
+                                .addTo(liveLayer).bindPopup(label + '<br>' + esc(m.mac)).bindTooltip(label, MAP_LABEL), op: null };
+                        mapDrones.set(key, d);
+                    } else d.m.setLatLng([m.lat, m.lng]);
                     if (m.opLat != null && m.opLng != null) {
-                        window.L.circleMarker([m.opLat, m.opLng], {
-                            radius: 6, color: color, fillColor: cssColor('var(--ss-bg)'), fillOpacity: 0.6, weight: 2
-                        }).addTo(liveLayer).bindPopup('Operator of ' + title).bindTooltip('Pilot', MAP_LABEL);
+                        if (!d.op) d.op = window.L.circleMarker([m.opLat, m.opLng], {
+                                radius: 6, color: color, fillColor: cssColor('var(--ss-bg)'), fillOpacity: 0.6, weight: 2
+                            }).addTo(liveLayer).bindPopup('Operator of ' + title).bindTooltip('Pilot', MAP_LABEL);
+                        else d.op.setLatLng([m.opLat, m.opLng]);
                     }
-                } else if (mapFix) {
-                    // Distance only. Dashed, unfilled, centred on you -- it must
-                    // never read as "the thing is here".
-                    window.L.circle([mapFix.lat, mapFix.lng], {
-                        radius: rssiMeters(m.rssi), color: color, weight: 1.5,
-                        dashArray: '6 6', fill: false, opacity: 0.8
-                    }).addTo(liveLayer).bindPopup(ico(cat.icon) + ' ' + title + '<br>' + esc(m.mac) +
-                        '<br>within ~' + Math.round(rssiMeters(m.rssi)) + ' m (signal strength only)');
-                    ringed++;
+                } else if (meShown) {
+                    // Distance only. Dashed and centred on you -- it never reads as
+                    // "the thing is here". The hunted one is drawn heavier.
+                    seen.add('r' + key);
+                    const target = rssiMeters(smoothedRssi(m));
+                    let r = mapRings.get(key);
+                    if (!r) {
+                        r = { c: window.L.circle([meShown.lat, meShown.lng], {
+                                    radius: target, color: color, weight: 1.5, dashArray: '6 6', fill: false, opacity: 0.8
+                                }).addTo(liveLayer).bindPopup(function () { return ringPopup(key); }),
+                              r: target, target: target, hunted: false };
+                        mapRings.set(key, r);
+                    }
+                    r.target = target;
+                    if (r.hunted !== hunted) {
+                        r.hunted = hunted;
+                        r.c.setStyle(hunted ? { weight: 3, dashArray: null, opacity: 1 } : { weight: 1.5, dashArray: '6 6', opacity: 0.8 });
+                    }
                 }
             }
-
+            mapDrones.forEach(function (d, key) {
+                if (seen.has('d' + key)) return;
+                liveLayer.removeLayer(d.m); if (d.op) liveLayer.removeLayer(d.op);
+                mapDrones.delete(key);
+            });
+            mapRings.forEach(function (r, key) {
+                if (seen.has('r' + key)) return;
+                liveLayer.removeLayer(r.c);
+                mapRings.delete(key);
+            });
+            kickMapAnim();
+            renderHuntLayer();
             renderMapPins();
+            renderMapNote();
+        }
 
-            const note = document.getElementById('map-note');
-            if (note) {
-                // Prose on one line, the button on the next: inline, the ring count
-                // wrapped onto the button's line and read as a stray word.
-                note.innerHTML = '<div>' + (mapFix ? '' : 'No fix yet. ') +
-                    'Solid markers are broadcast coordinates (drones). ' +
-                    'Dashed rings are distance-from-you estimates from signal strength \u2014 ' +
-                    'not locations.' + (ringed ? ' ' + ringed + (ringed === 1 ? ' ring.' : ' rings.') : '') + '</div>' +
-                    '<div style="margin-top:6px"><button class="scope-act" onclick="recenterMap()">\u27f3 Recenter</button>' +
-                    (pinsCache.length ? '' : ' <span style="opacity:0.7">Saved pins appear once unlocked.</span>') + '</div>';
+        // Where you have walked during this hunt, coloured by signal strength,
+        // plus the estimate (circle) and the strongest spot you've stood on.
+        let huntLayerParts = null;
+        function renderHuntLayer() {
+            if (!map || !huntLayer || !window.L) return;
+            if (!huntMac) { if (huntLayerParts) { huntLayer.clearLayers(); huntLayerParts = null; huntDotsDrawn = 0; } return; }
+            if (!huntLayerParts) huntLayerParts = { dots: [], est: null, estDot: null, peak: null };
+            const P = huntLayerParts;
+            // Readings: append only (cheap), oldest dropped with the buffer.
+            // Coloured on THIS hunt's own weakest..strongest span: a real hunt
+            // covers ~20 dB, which on a fixed -100..-30 scale was all one blue.
+            while (P.dots.length > huntSamples.length) huntLayer.removeLayer(P.dots.shift());
+            huntDotsDrawn = Math.min(huntDotsDrawn, P.dots.length);
+            let lo = Infinity, hi = -Infinity;
+            for (const h of huntSamples) { if (h.rssi < lo) lo = h.rssi; if (h.rssi > hi) hi = h.rssi; }
+            if (hi - lo < 6) { const mid = (hi + lo) / 2; lo = mid - 3; hi = mid + 3; }
+            const span = Math.round(lo) + ':' + Math.round(hi);
+            if (P.span !== span) {   // range moved: recolour what is drawn
+                P.span = span;
+                P.dots.forEach(function (d, i) { d.setStyle({ fillColor: heatColor(huntSamples[i].rssi, lo, hi) }); });
             }
+            for (let i = P.dots.length; i < huntSamples.length; i++) {
+                const s = huntSamples[i];
+                P.dots.push(window.L.circleMarker([s.lat, s.lng], {
+                    radius: 3, stroke: false, fillColor: heatColor(s.rssi, lo, hi), fillOpacity: 0.85, interactive: false
+                }).addTo(huntLayer));
+            }
+            const est = huntEst;
+            const amber = cssColor('var(--accent-amber)');
+            if (est && est.ready) {
+                const ll = [est.lat, est.lng];
+                if (!P.est) {
+                    P.est = window.L.circle(ll, { radius: est.r68, color: amber, weight: 2, dashArray: '4 4',
+                                                  fillColor: amber, fillOpacity: 0.12, interactive: false }).addTo(huntLayer);
+                    P.estDot = window.L.circleMarker(ll, { radius: 6, color: '#000', weight: 2, fillColor: amber, fillOpacity: 1 })
+                        .addTo(huntLayer).bindTooltip('Estimate', MAP_LABEL)
+                        .bindPopup(function () { return huntEstPopup(); });
+                } else {
+                    P.est.setLatLng(ll); P.est.setRadius(est.r68); P.estDot.setLatLng(ll);
+                }
+            } else if (P.est) {
+                huntLayer.removeLayer(P.est); huntLayer.removeLayer(P.estDot); P.est = P.estDot = null;
+            }
+            const peak = est && est.peak;
+            if (peak) {
+                if (!P.peak) P.peak = window.L.circleMarker([peak.lat, peak.lng], { radius: 5, color: '#fff', weight: 2,
+                                        fillColor: cssColor('var(--ss-live)'), fillOpacity: 1 })
+                                    .addTo(huntLayer).bindTooltip('Strongest', MAP_LABEL);
+                else P.peak.setLatLng([peak.lat, peak.lng]);
+            }
+        }
+        // Hunt panel "Map" button: open the map on the hunt.
+        function showHuntMap() {
+            if (viewMode !== 'map') toggleView();
+            const wrap = document.getElementById('map-wrap');
+            setTimeout(function () {
+                if (!map) return;
+                try { map.invalidateSize(); } catch (e) {}
+                // Frame the whole hunt -- where you walked, the estimate and you --
+                // rather than just your dot, which left the estimate off-screen.
+                const pts = huntSamples.map(function (h) { return [h.lat, h.lng]; });
+                if (mapFix) pts.push([mapFix.lat, mapFix.lng]);
+                if (huntEst && huntEst.ready) pts.push([huntEst.lat, huntEst.lng]);
+                if (pts.length >= 2) {
+                    mapFollow = false;
+                    map.fitBounds(window.L.latLngBounds(pts).pad(0.15), { maxZoom: 19 });
+                } else if (mapFix) {
+                    mapFollow = true;
+                    map.setView([mapFix.lat, mapFix.lng], Math.max(map.getZoom(), 18));
+                }
+                renderHuntLayer();
+                renderMapNote();
+                if (wrap && wrap.scrollIntoView) wrap.scrollIntoView({ block: 'start', behavior: 'smooth' });
+            }, 50);
+        }
+        function huntEstPopup() {
+            const e = huntEst, L = window.SSLocate;
+            if (!e || !e.ready || !L) return 'No estimate yet';
+            return '<b>Estimated position</b><br>' + esc(L.fmtDD(e.lat, e.lng, 6)) + '<br>' + esc(L.toMGRS(e.lat, e.lng)) +
+                '<br>likely within ' + L.fmtFeet(e.r68) + ' (' + esc(e.quality) + ')' +
+                '<br><button class="scope-act" onclick="pinEstimate()">Pin estimate</button>';
+        }
+        // Weak (blue) .. strong (red) across lo..hi dBm (default -100..-30).
+        function heatColor(rssi, lo, hi) {
+            if (lo == null) { lo = -100; hi = -30; }
+            const f = Math.max(0, Math.min(1, (Number(rssi) - lo) / Math.max(1, hi - lo)));
+            const hue = 220 - 220 * f;
+            return 'hsl(' + Math.round(hue) + ',90%,55%)';
+        }
+
+        function renderMapNote() {
+            const note = document.getElementById('map-note');
+            if (!note) return;
+            const L = window.SSLocate;
+            const bits = [];
+            if (!mapFix) bits.push('No location fix yet.');
+            if (mapTilesFailing) bits.push('Map tiles are not loading (no internet on this connection) — positions and pins still work.');
+            bits.push('Solid markers are broadcast coordinates (drones). Dashed rings are distance-from-you estimates from signal strength — not locations.');
+            if (huntMac) bits.push('Hunting: coloured dots are where you walked (blue weak → red strong); the amber circle is the estimate.');
+            note.innerHTML = '<div>' + bits.join(' ') + '</div>' +
+                '<div style="margin-top:6px"><button class="scope-act" onclick="recenterMap()">' +
+                (mapFollow ? '◎ Following you' : '⟳ Recenter') + '</button>' +
+                (pinsCache.length || !pinStoreExists() ? '' : ' <span style="opacity:0.7">Saved pins appear once unlocked.</span>') +
+                (mapFix && L ? ' <span style="opacity:0.7">You: ±' + L.fmtFeet(mapFix.acc) + '</span>' : '') + '</div>';
         }
 
         // Saved pins are drawn only when the store is already unlocked in this
         // session. Opening the map must never prompt for the PIN -- the PIN
         // gates viewing and export, and nothing else.
+        function pinIcon(source) {
+            const fill = source === 'estimate' ? cssColor('var(--accent-amber)') : cssColor('var(--ss-live)');
+            return window.L.divIcon({
+                className: 'ss-pin',
+                html: '<svg width="26" height="34" viewBox="0 0 26 34" aria-hidden="true"><path d="M13 1C6.4 1 1 6.3 1 12.9 1 22 13 33 13 33s12-11 12-20.1C25 6.3 19.6 1 13 1z" fill="' +
+                      fill + '" stroke="#000" stroke-width="1.5"/><circle cx="13" cy="13" r="4.5" fill="#000"/></svg>',
+                iconSize: [26, 34], iconAnchor: [13, 33], popupAnchor: [0, -30]
+            });
+        }
         function renderMapPins() {
             if (!pinLayer || !window.L) return;
             pinLayer.clearLayers();
             if (!pinKey) return;
-            for (const pin of pinsCache) {
-                if (pin.lat == null || pin.lng == null) continue;
+            const L = window.SSLocate;
+            pinsCache.forEach(function (pin, i) {
+                if (pin.lat == null || pin.lng == null) return;
                 const cat = categoryOf(pin.category || pin.rule);
-                window.L.marker([pin.lat, pin.lng]).addTo(pinLayer)
-                    .bindPopup(ico('pin') + ' ' + esc(pin.name || pin.rule || cat.label) +
-                               '<br>' + esc(pin.mac) +
-                               '<br>' + esc(new Date(pin.ts).toLocaleString()));
-            }
+                window.L.marker([pin.lat, pin.lng], { icon: pinIcon(pin.source) }).addTo(pinLayer)
+                    .bindPopup(ico('pin') + ' <b>' + esc(pin.name || pin.rule || pin.category || cat.label) + '</b>' +
+                               (pin.mac ? '<br>' + esc(pin.mac) : '') +
+                               '<br>' + esc(L ? L.fmtDD(pin.lat, pin.lng, 6) : pin.lat + ', ' + pin.lng) +
+                               (L ? '<br>' + esc(L.toMGRS(pin.lat, pin.lng)) : '') +
+                               '<br>' + (pin.source === 'estimate' ? 'Estimated' : 'Pinned') + ' ±' + (L ? L.fmtFeet(pin.acc) : Math.round(pin.acc) + ' m') +
+                               ' · ' + esc(new Date(pin.ts).toLocaleString()) +
+                               '<br><button class="scope-act" onclick="openPinSheet(' + i + ')">Coordinates &amp; share</button>');
+            });
         }
 
         // Repaint on a timer so stale rows fade even when no new data arrives.
@@ -1282,6 +1667,9 @@
             document.addEventListener('DOMContentLoaded', function () {
                 renderStatusStrip();
                 renderScope();
+                // Served by the board itself over its hotspot: connect straight
+                // away, there is nothing to pick.
+                if (onBoardOrigin() || window.SS_WIFI_AUTOCONNECT) setTimeout(function () { connectWifi(true); }, 200);
             });
         }
 
@@ -1329,6 +1717,7 @@
                 if (data.sdls) { handleSdList(data.sdls); return; }
                 if (data.sdget) { handleSdGet(data.sdget); return; }
                 if (data.sdrm) { if (data.sdrm.err) showToast('Delete failed: ' + data.sdrm.err, '✕'); return; }
+                if (typeof data.wifi_err === 'string') { showToast(data.wifi_err, '\u2715'); return; }
                 // Ring result: the firmware reports whether the write landed.
                 if (typeof data.ring === 'string' && 'ok' in data) {
                     showToast(data.ok ? 'Ring landed — listen for it'
@@ -1347,7 +1736,9 @@
                                })];
                     const now = Date.now();
                     if (hm) { hm.rssi = data.hunt_rssi; hm.ts = now; }
-                    pushHuntSample(data.hunt_rssi, now);
+                    const sm = smoothRssi(data.hunt, data.hunt_rssi, now);
+                    pushHuntSample(data.hunt_rssi, now, sm);
+                    addHuntSample();
                     try { renderFoxhunt(); } catch (e) { console.warn('foxhunt render failed:', e); }
                     return;
                 }
@@ -1862,7 +2253,7 @@
             // Short forms: the name, the uptime and the alert count share one
             // line with the Disconnect button, and "Bluetooth" alone cost
             // enough of it to ellipsize the board's own name.
-            const via = { BLE: 'BLE', USB: 'USB', SERIAL: 'Serial' }[connectionType] || connectionType;
+            const via = { BLE: 'BLE', USB: 'USB', SERIAL: 'Serial', WIFI: 'Wi-Fi' }[connectionType] || connectionType;
             set('hdr-dot', 'hdr-dev',
                 connectionType ? 'ok' : 'off',
                 !connectionType ? 'Not connected'
@@ -2178,6 +2569,186 @@
             showToast((auto ? 'Auto-pinned ' + cat.label + ' (' : 'Pin saved (') + pinsCache.length + ' total)', 'pin');
         }
 
+        // ---- Hunt pins: "Found it" and "Pin estimate" --------------------------
+        // A pin is what gets handed to the rest of the team, so it carries the
+        // device, when, how sure, and the position in all three formats a team
+        // might use (decimal lat/long, degrees-minutes-seconds, MGRS).
+        //
+        // "Found it" is the precise one: you are standing at the device, so it
+        // is your own GPS position, taken as the best fix over a few seconds.
+        // "Pin estimate" saves the locator's estimate and its uncertainty.
+        const PIN_FOUND_WAIT_MS = 8000;   // wait up to this long for a tighter fix
+        const PIN_FOUND_GOOD_M = 6;       // ~20 ft: stop waiting once this good
+
+        function huntTargetMatch() {
+            if (!huntMac) return null;
+            return liveMatches[huntMac] || liveMatches[Object.keys(liveMatches).find(function (k) {
+                return k.toUpperCase() === huntMac.toUpperCase();
+            })] || { mac: huntMac };
+        }
+
+        // Best fix over a short window, from the live watch (started if needed).
+        function preciseFix() {
+            updateGeoWatch();
+            return new Promise(function (resolve, reject) {
+                const t0 = Date.now();
+                let best = null;
+                const tick = function () {
+                    if (mapFix && Date.now() - mapFix.t < 3000 && (!best || mapFix.acc < best.acc)) {
+                        best = { lat: mapFix.lat, lng: mapFix.lng, acc: mapFix.acc };
+                    }
+                    if (best && best.acc <= PIN_FOUND_GOOD_M) { resolve(best); return; }
+                    if (Date.now() - t0 >= PIN_FOUND_WAIT_MS) {
+                        if (best) { resolve(best); return; }
+                        // No watch available at all: one-shot fallback.
+                        getFix().then(resolve, reject);
+                        return;
+                    }
+                    setTimeout(tick, 400);
+                };
+                tick();
+            });
+        }
+
+        async function saveHuntPin(m, pos, source, extra) {
+            const cat = categoryOf(m.type || m.rule);
+            const pin = Object.assign({
+                mac: m.mac || '', category: cat.label, rule: m.rule || '', name: m.name || '',
+                rssi: m.rssi, lat: pos.lat, lng: pos.lng, acc: pos.acc, ts: Date.now(), source: source
+            }, extra || {});
+            pinsCache.push(pin);
+            await savePins();
+            paintLogSession();
+            renderMapPins();
+            renderPins();
+            openPinSheet(pinsCache.length - 1);
+        }
+
+        function pinFound() {
+            const m = huntTargetMatch();
+            if (!m) { showToast('Lock onto a device first', 'info'); return; }
+            ensurePinUnlocked(async function () {
+                showToast('Getting a precise fix — hold still…', 'pin');
+                try {
+                    const fix = await preciseFix();
+                    await saveHuntPin(m, fix, 'found');
+                } catch (e) {
+                    showToast('No location fix — pin not saved', '✕');
+                }
+            });
+        }
+
+        function pinEstimate() {
+            const m = huntTargetMatch();
+            const e = huntEst;
+            if (!m || !e || !e.ready) { showToast('No estimate yet — keep walking', 'info'); return; }
+            const snap = { lat: e.lat, lng: e.lng, acc: e.r68 };
+            const extra = { r95: Math.round(e.r95 * 10) / 10, readings: e.n, quality: e.quality };
+            ensurePinUnlocked(function () { return saveHuntPin(m, snap, 'estimate', extra); });
+        }
+
+        function pinText(p) {
+            const L = window.SSLocate;
+            const what = p.name || p.rule || p.category || 'Device';
+            const lines = [
+                'SignalSweep pin — ' + what + (p.mac ? ' (' + p.mac + ')' : ''),
+                (p.source === 'estimate' ? 'Estimated position' : 'Found at') + ', ' + new Date(p.ts).toLocaleString(),
+                'Lat/Long: ' + L.fmtDD(p.lat, p.lng, 6),
+                'DMS: ' + L.fmtDMS(p.lat, p.lng),
+                'MGRS: ' + L.toMGRS(p.lat, p.lng),
+                'Accuracy: ±' + L.fmtFeet(p.acc) + (p.source === 'estimate' ? ' (signal-strength estimate)' : ' (GPS)'),
+                'https://www.google.com/maps/search/?api=1&query=' + p.lat.toFixed(6) + ',' + p.lng.toFixed(6)
+            ];
+            return lines.join('\n');
+        }
+
+        function copyText(text, what) {
+            const done = function () { showToast((what || 'Text') + ' copied', '✓'); };
+            if (navigator.clipboard && navigator.clipboard.writeText) {
+                navigator.clipboard.writeText(text).then(done, function () { copyFallback(text) && done(); });
+            } else if (copyFallback(text)) done();
+        }
+        function copyFallback(text) {
+            try {
+                const ta = document.createElement('textarea');
+                ta.value = text; ta.setAttribute('readonly', ''); ta.style.position = 'fixed'; ta.style.opacity = '0';
+                document.body.appendChild(ta); ta.select();
+                const ok = document.execCommand('copy');
+                document.body.removeChild(ta);
+                return ok;
+            } catch (e) { return false; }
+        }
+
+        let pinSheetIndex = -1;
+        function openPinSheet(i) {
+            const p = pinsCache[i];
+            const body = document.getElementById('pinsheet-body');
+            const modal = document.getElementById('pinsheet-modal');
+            if (!p || !body || !modal || !window.SSLocate) return;
+            pinSheetIndex = i;
+            const L = window.SSLocate;
+            const cat = categoryOf(p.category || p.rule);
+            const row = function (label, value, key) {
+                return '<div class="ps-row"><div class="ps-k">' + label + '</div><div class="ps-v">' + esc(value) + '</div>' +
+                    '<button class="scope-act" onclick="copyPinField(\'' + key + '\')">Copy</button></div>';
+            };
+            const q = encodeURIComponent(p.lat.toFixed(6) + ',' + p.lng.toFixed(6));
+            const label = encodeURIComponent(p.name || p.rule || p.category || 'SignalSweep pin');
+            body.innerHTML =
+                '<div class="ps-title">' + ico(cat.icon) + ' ' + esc(p.name || p.rule || p.category || 'Device') + '</div>' +
+                '<div class="ps-sub">' + esc(p.mac || '') + (p.mac ? ' · ' : '') + esc(new Date(p.ts).toLocaleString()) + '</div>' +
+                '<div class="ps-badge ' + (p.source === 'estimate' ? 'est' : 'found') + '">' +
+                    (p.source === 'estimate' ? 'Estimated · likely within ' : p.source === 'found' ? 'Found here · GPS ±' : 'Pinned · GPS ±') +
+                    L.fmtFeet(p.acc) + '</div>' +
+                row('Lat/Long', L.fmtDD(p.lat, p.lng, 6), 'dd') +
+                row('DMS', L.fmtDMS(p.lat, p.lng), 'dms') +
+                row('MGRS', L.toMGRS(p.lat, p.lng), 'mgrs') +
+                '<div class="ps-actions">' +
+                    '<button class="ctrl-btn" onclick="sharePin()">Share pin</button>' +
+                    '<button class="ctrl-btn" onclick="copyPinField(\'all\')">Copy all</button>' +
+                    '<a class="ctrl-btn" target="_blank" rel="noopener" href="https://maps.apple.com/?ll=' + q + '&q=' + label + '">Apple Maps</a>' +
+                    '<a class="ctrl-btn" target="_blank" rel="noopener" href="https://www.google.com/maps/search/?api=1&query=' + q + '">Google Maps</a>' +
+                    '<button class="ctrl-btn" onclick="showPinOnMap()">Show on map</button>' +
+                '</div>';
+            modal.classList.add('active');
+        }
+        function closePinSheet() {
+            const modal = document.getElementById('pinsheet-modal');
+            if (modal) modal.classList.remove('active');
+        }
+        function copyPinField(key) {
+            const p = pinsCache[pinSheetIndex];
+            if (!p) return;
+            const L = window.SSLocate;
+            const v = { dd: L.fmtDD(p.lat, p.lng, 6), dms: L.fmtDMS(p.lat, p.lng), mgrs: L.toMGRS(p.lat, p.lng), all: pinText(p) }[key];
+            copyText(v, { dd: 'Lat/Long', dms: 'DMS', mgrs: 'MGRS', all: 'Pin' }[key]);
+        }
+        function sharePin() {
+            const p = pinsCache[pinSheetIndex];
+            if (!p) return;
+            const text = pinText(p);
+            if (navigator.share) {
+                navigator.share({ title: 'SignalSweep pin', text: text }).catch(function () {});
+            } else {
+                copyText(text, 'Pin');
+            }
+        }
+        function showPinOnMap() {
+            const p = pinsCache[pinSheetIndex];
+            closePinSheet();
+            if (!p) return;
+            showTab('sweep');
+            if (viewMode !== 'map') toggleView();
+            mapFollow = false;
+            setTimeout(function () {
+                if (!map) return;
+                try { map.invalidateSize(); } catch (e) {}
+                map.setView([p.lat, p.lng], 19);
+                renderMapPins();
+                renderMapNote();
+            }, 50);
+        }
+
         // ---- PIN gate modal ----
         let pendingPinAction = null;   // run after a successful unlock/create
         let pinGateMode = 'unlock';    // 'unlock' | 'create'
@@ -2235,11 +2806,14 @@
             } else {
                 body.innerHTML = pinsCache.map((p, i) => {
                     const cat = categoryOf(p.category);
+                    const L = window.SSLocate;
+                    const tag = p.source === 'found' ? ' \u00b7 found here' : p.source === 'estimate' ? ' \u00b7 estimate' : '';
                     return '<div class="scope-row" style="border-left:4px solid ' + cat.color + '">' +
-                        '<div class="scope-main">' +
-                            '<div class="scope-title">' + ico(cat.icon) + ' ' + esc(p.category) + (p.photo ? ' ' + ico('camera') : '') + '</div>' +
-                            '<div class="scope-sub">' + esc(p.mac || (p.source === 'camera-log' ? 'photo log' : '')) + ' · ' + p.lat.toFixed(5) + ', ' + p.lng.toFixed(5) +
-                                ' · ±' + Math.round(p.acc) + 'm · ' + new Date(p.ts).toLocaleString() + '</div>' +
+                        '<div class="scope-main" style="cursor:pointer" onclick="openPinSheet(' + i + ')">' +
+                            '<div class="scope-title">' + ico(cat.icon) + ' ' + esc(p.name || p.category) + (p.photo ? ' ' + ico('camera') : '') + esc(tag) + '</div>' +
+                            '<div class="scope-sub">' + esc(p.mac || (p.source === 'camera-log' ? 'photo log' : '')) + ' · ' + p.lat.toFixed(6) + ', ' + p.lng.toFixed(6) +
+                                (L ? ' · ' + esc(L.toMGRS(p.lat, p.lng)) : '') +
+                                ' · ±' + (L ? L.fmtFeet(p.acc) : Math.round(p.acc) + 'm') + ' · ' + new Date(p.ts).toLocaleString() + '</div>' +
                         '</div>' +
                         '<button class="scope-del" onclick="deletePin(' + i + ')">✕</button>' +
                     '</div>';
@@ -2760,6 +3334,7 @@
             setThemeUi(cfg.theme);
             setVolUi(cfg.vol);
             setBandUi(cfg.band);
+            setWifiUi(cfg);
             // Absent means "unknown" (the board couldn't lock its list in
             // time), never "empty" -- keep the last list the app had.
             if (Array.isArray(cfg.ignore)) {
@@ -3387,7 +3962,7 @@
                 ? 'THIS CONNECTION WILL DROP and the app will not reconnect on its own. ' +
                   'Tap the BOOT button on the device to make it discoverable again for ' +
                   'two minutes.'
-                : 'This cable is unaffected and keeps full control -- only the radio ' +
+                : 'This connection is unaffected and keeps full control -- only the radio ' +
                   'goes quiet. Bluetooth clients will not see the device until you ' +
                   'turn advertising back on here, or tap BOOT.';
             if (!confirm(
@@ -3407,6 +3982,8 @@
             if (devHunt.toUpperCase() !== huntMac.toUpperCase()) {
                 huntMac = devHunt;
                 huntTrace = [];
+                resetHuntLocate();
+                updateGeoWatch();
             }
             // The sound settings ride the 1 Hz push as well as the CMD:CFG
             // reply, so the controls reconcile with the board every second
@@ -4053,7 +4630,15 @@
                 bleBadge.className = 'api-badge ok'; bleBadge.textContent = 'Supported';
             } else {
                 bleBadge.className = 'api-badge warn'; bleBadge.textContent = 'Not Supported';
+                // No Web Bluetooth (every iPhone/iPad browser, Safari, Firefox):
+                // the Wi-Fi hotspot is the way in, so it goes first and lit.
+                const bleBtn = document.getElementById('btnConnBle');
+                const wifiBtn = document.getElementById('btnConnWifi');
+                if (bleBtn) { bleBtn.classList.remove('primary'); const sub = document.getElementById('connBleSub'); if (sub) sub.textContent = 'Not available in this browser'; }
+                if (wifiBtn) { wifiBtn.classList.add('primary'); if (wifiBtn.parentNode) wifiBtn.parentNode.insertBefore(wifiBtn, wifiBtn.parentNode.firstChild); }
             }
+            const wifiBadge = document.getElementById('wifiSupportBadge');
+            if (wifiBadge) { wifiBadge.className = 'api-badge ok'; wifiBadge.textContent = 'Any browser'; }
             // Two different transports reach the same cable: WebSerial in a
             // desktop browser, and the Android USB host stack through the
             // plugin. Show the button wherever either exists, and hide it
@@ -4122,7 +4707,7 @@
                 closeConnModal();
                 renderStatusStrip();
                 paintIgnoreList();   // flips "connect the board" note now that one is
-                showToast(`Connected via ${type}`, '✓');
+                showToast('Connected via ' + ({ WIFI: 'Wi-Fi', SERIAL: 'serial', USB: 'USB', BLE: 'Bluetooth' }[type] || type), '✓');
                 // Ask the device what it is, and what it was already doing.
                 // Done here rather than at each of the five connect sites.
                 // requestConfig() owns its own delay and retries -- the first
@@ -4138,6 +4723,7 @@
                 setBuzzerUi(null);
                 setLedUi(null);
                 setThemeUi(null);
+                setWifiUi(null);
                 setVolUi(null);
                 setBandUi(null);
                 // Same reason: the category mask is per-board too, and it used
@@ -4669,6 +5255,13 @@
                     showToast(friendlyError('Sending to the board', err), '\u2715');
                     return false;
                 }
+            } else if (connectionType === 'WIFI' && wsSock && wsSock.readyState === 1) {
+                try { wsSock.send(jsonStr); return true; }
+                catch (err) {
+                    console.error('Wi-Fi send error:', err);
+                    showToast(friendlyError('Sending to the board', err), '\u2715');
+                    return false;
+                }
             } else if (connectionType === 'SERIAL' && serialWriter) {
                 try { await serialWriter.write(jsonStr); return true; }
                 catch (err) {
@@ -4685,6 +5278,13 @@
 
         async function disconnectDevice() {
             cancelReconnect();
+            if (wsSock || wantWifi) {
+                wantWifi = false;
+                if (wifiRetryTimer) { clearTimeout(wifiRetryTimer); wifiRetryTimer = null; }
+                const ws = wsSock; wsSock = null;
+                if (ws) { try { ws.close(); } catch (e) {} }
+                if (connectionType === 'WIFI') { onDeviceDisconnected(); return; }
+            }
             if (bleDevice) {
                 if (bleDevice.gatt && bleDevice.gatt.connected) {
                     bleDevice.gatt.disconnect();
@@ -4728,6 +5328,164 @@
             if (port) { try { await port.close(); } catch (e) { console.warn('serial close failed', e); } }
             serialPort = null;
             onDeviceDisconnected();
+        }
+
+        // =====================================================================
+        //  Wi-Fi hotspot link (secure WebSocket to the board)
+        // =====================================================================
+        // For every browser with no Web Bluetooth and no Web Serial: all iPhone
+        // and iPad browsers, Safari on a Mac, Firefox. The board runs its own
+        // hotspot and serves this app at https://192.168.4.1/ (firmware
+        // wifi_link.cpp); the page then talks to wss://192.168.4.1/ws. Lines on
+        // the socket are exactly the lines the board sends over BLE and USB, so
+        // everything downstream (processIncomingChunk) is shared.
+        const BOARD_HOST = '192.168.4.1';
+        let wsSock = null;
+        let wantWifi = false;
+        let wifiRetryTimer = null;
+        let wifiRetryDelay = 0;
+        let wifiKeepalive = null;
+        function onBoardOrigin() {
+            try {
+                return location.protocol === 'https:' &&
+                    (location.hostname === BOARD_HOST || /^signalsweep\.local$/i.test(location.hostname));
+            } catch (e) { return false; }
+        }
+        function wifiUrl() {
+            // window.SS_WIFI_URL: a test hook (a simulated board on localhost).
+            if (window.SS_WIFI_URL) return window.SS_WIFI_URL;
+            return 'wss://' + (onBoardOrigin() ? location.host : BOARD_HOST) + '/ws';
+        }
+        function connectWifi(auto) {
+            if (wsSock) return;
+            if (connectionType && connectionType !== 'WIFI') {
+                showToast('Already connected over ' + connectionType + ' — disconnect first', 'info');
+                return;
+            }
+            wantWifi = true;
+            if (wifiRetryTimer) { clearTimeout(wifiRetryTimer); wifiRetryTimer = null; }
+            setConnState('warn', 'Connecting over Wi‑Fi…');
+            let ws;
+            try { ws = new WebSocket(wifiUrl()); }
+            catch (e) { wifiNeverOpened(auto); return; }
+            wsSock = ws;
+            let opened = false;
+            const openTimeout = setTimeout(function () { if (!opened) { try { ws.close(); } catch (e) {} } }, 6000);
+            ws.onopen = function () {
+                opened = true;
+                clearTimeout(openTimeout);
+                wifiRetryDelay = 0;
+                rxBuffer = '';
+                updateConnectionUI(true, 'WIFI');
+                // Keepalive: the board's HTTPS server recycles its least-recently
+                // used socket when full, and a socket that only ever receives
+                // looks idle. The board drops CMD:HOST on this link.
+                if (wifiKeepalive) clearInterval(wifiKeepalive);
+                wifiKeepalive = setInterval(function () {
+                    if (wsSock === ws && ws.readyState === 1) { try { ws.send('CMD:HOST\n'); } catch (e) {} }
+                    else { clearInterval(wifiKeepalive); wifiKeepalive = null; }
+                }, 4000);
+            };
+            ws.onmessage = function (ev) {
+                if (typeof ev.data === 'string') processIncomingChunk(ev.data, false);
+            };
+            ws.onerror = function () { /* onclose follows and decides */ };
+            ws.onclose = function () {
+                clearTimeout(openTimeout);
+                if (wsSock === ws) wsSock = null;
+                if (opened) {
+                    if (connectionType === 'WIFI') onDeviceDisconnected();   // retries if wanted
+                    else if (wantWifi) scheduleWifiRetry();
+                } else {
+                    wifiNeverOpened(auto);
+                }
+            };
+        }
+        function wifiNeverOpened(auto) {
+            // On the board's own page the board is right there: keep trying
+            // (it may be rebooting, or the phone just woke). Anywhere else a
+            // first failure means "not on the hotspot" -- explain, don't loop.
+            if (onBoardOrigin() || (auto && wantWifi)) { updateConnectionUI(false); scheduleWifiRetry(); return; }
+            wantWifi = false;
+            updateConnectionUI(false);
+            openWifiHelp();
+        }
+        function scheduleWifiRetry() {
+            if (!wantWifi || wifiRetryTimer) return;
+            wifiRetryDelay = Math.min(wifiRetryDelay ? wifiRetryDelay * 2 : 1000, 15000);
+            setConnState('warn', 'Wi‑Fi link lost — retrying in ' + Math.round(wifiRetryDelay / 1000) + 's…');
+            wifiRetryTimer = setTimeout(function () {
+                wifiRetryTimer = null;
+                if (wantWifi && !wsSock) connectWifi(true);
+            }, wifiRetryDelay);
+        }
+        // The connect-dialog button.
+        function connectWifiButton() {
+            if (onBoardOrigin() || window.SS_WIFI_URL) { connectWifi(false); return; }
+            // From the hosted app (GitHub Pages) or the Android APK, the board
+            // can still be reached if this device is on its hotspot and trusts
+            // its certificate; if not, the help explains how.
+            connectWifi(false);
+        }
+        function openWifiHelp() {
+            closeConnModal();
+            const m = document.getElementById('wifi-help-modal');
+            if (m) m.classList.add('active');
+        }
+        function closeWifiHelp() {
+            const m = document.getElementById('wifi-help-modal');
+            if (m) m.classList.remove('active');
+        }
+
+        // ---- Hotspot settings (Settings > Wi-Fi hotspot) -----------------------
+        let deviceWifi = null;   // last cfg's wifi block, or null (unknown / no support)
+        function setWifiUi(cfg) {
+            const btn = document.getElementById('btn-wifi');
+            const info = document.getElementById('wifi-info');
+            const pass = document.getElementById('cfg-wifipass');
+            if (!cfg || typeof cfg.wifi !== 'boolean') {
+                deviceWifi = null;
+                if (btn) { btn.classList.remove('on'); btn.classList.add('off'); btn.textContent = '—'; btn.disabled = true; }
+                if (info) info.textContent = connectionType
+                    ? 'This board’s firmware has no Wi‑Fi hotspot (it needs the XIAO ESP32‑C5 build).'
+                    : 'Connect the board to see the hotspot.';
+                return;
+            }
+            deviceWifi = { on: cfg.wifi, ssid: cfg.wifi_ssid || '', pass: cfg.wifi_pass || '', ch: cfg.wifi_ch, clients: cfg.wifi_clients || 0 };
+            if (btn) {
+                btn.disabled = false;
+                btn.classList.toggle('on', cfg.wifi);
+                btn.classList.toggle('off', !cfg.wifi);
+                btn.textContent = cfg.wifi ? 'On' : 'Off';
+            }
+            if (info) {
+                info.innerHTML = 'Network <b>' + esc(deviceWifi.ssid) + '</b> · password <b>' + esc(deviceWifi.pass) + '</b><br>' +
+                    (cfg.wifi
+                        ? 'On, channel ' + esc(deviceWifi.ch) + ' · ' + deviceWifi.clients + (deviceWifi.clients === 1 ? ' app' : ' apps') + ' connected over Wi‑Fi'
+                        : 'Off — full Wi‑Fi channel sweep');
+            }
+            if (pass && document.activeElement !== pass && !pass.value) pass.placeholder = '8–63 characters (now: ' + deviceWifi.pass + ')';
+        }
+        function toggleWifiHotspot() {
+            if (!connectionType) { showToast('Connect the device first', '…'); return; }
+            if (!deviceWifi) return;
+            const turnOn = !deviceWifi.on;
+            if (turnOn && !confirm('Turn on the board’s Wi‑Fi hotspot?\n\nWhile it is on, Wi‑Fi detection watches only channel ' +
+                    (deviceWifi.ch || 6) + ' (Bluetooth detection is unaffected). It turns itself off after 10 minutes with nobody connected.')) return;
+            if (!turnOn && connectionType === 'WIFI' &&
+                !confirm('You are connected over this hotspot. Turning it off ends this connection.')) return;
+            sendCommand({ wifi: turnOn });
+            showToast(turnOn ? 'Hotspot starting…' : 'Hotspot off', turnOn ? '…' : '○');
+        }
+        function saveWifiPass() {
+            const el = document.getElementById('cfg-wifipass');
+            const v = el ? el.value.trim() : '';
+            if (v.length < 8 || v.length > 63) { showToast('Password must be 8–63 characters', '✕'); return; }
+            if (connectionType === 'WIFI' && deviceWifi && deviceWifi.on &&
+                !confirm('The hotspot restarts with the new password, so this connection will drop. Rejoin with the new password.')) return;
+            sendCommand({ wifi_pass: v });
+            if (el) el.value = '';
+            showToast('Password saved', '✓');
         }
 
         // ---- Auto-reconnect (BLE only) ----
@@ -4799,6 +5557,7 @@
             dropSightingFixes();
             updateConnectionUI(false);
             if (wantConnection) scheduleReconnect();
+            if (wantWifi) scheduleWifiRetry();
         }
 
         // Drop everything the device told us. This is the "no passive trail"
@@ -4821,6 +5580,9 @@
             mapFix = null;
             huntMac = '';
             huntTrace = [];
+            rssiSmooth.clear();
+            resetHuntLocate();
+            updateGeoWatch();
             expandedGroups = new Set();
             expandedRows = new Set();
             // Per link, not per app session: a bad stretch on the last board
@@ -4844,6 +5606,8 @@
             paintIgnoreList();
             if (liveLayer) liveLayer.clearLayers();
             if (meLayer) meLayer.clearLayers();
+            mapRings.clear(); mapDrones.clear();
+            meDot = null; meAcc = null; meShown = null; meTarget = null;
             renderScope();
         }
 

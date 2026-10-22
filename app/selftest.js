@@ -1106,6 +1106,76 @@ console.log('[signalsweep self-test] attack-gear rules gated by the Attack toggl
     console.log('[signalsweep self-test] no third-party font hosts: ok');
 }
 
+// ---------------------------------------------------------------------------
+// Hunt locator + pin formats (public/locate.js). MGRS was cross-checked
+// against proj4js/mgrs on 20,010 points when written; these pin it in place.
+{
+    await import('./public/locate.js');
+    const L = global.SSLocate;
+    const f = [];
+    const mg = (lat, lng) => L.toMGRS(lat, lng).replace(/ /g, '');
+    if (mg(0, 0) !== '31NAA6602100000') f.push('MGRS at 0,0: ' + mg(0, 0));
+    if (mg(35.9251, -86.8689) !== '16SEE1182675648') f.push('MGRS Franklin TN: ' + mg(35.9251, -86.8689));
+    if (!/^32V/.test(mg(60, 5))) f.push('Norway zone exception lost: ' + mg(60, 5));
+    if (!/^33X/.test(mg(78.2, 15.6))) f.push('Svalbard zone exception lost: ' + mg(78.2, 15.6));
+    if (L.fmtDMS(35.9251, -86.8689) !== '35°55′30.4″N 86°52′08.0″W') f.push('DMS: ' + L.fmtDMS(35.9251, -86.8689));
+    if (L.fmtDMS(-33.85, 151.999999).indexOf('152°00′00.0″E') < 0) f.push('DMS carry at 59.99": ' + L.fmtDMS(-33.85, 151.999999));
+    if (L.fmtFeet(10) !== '33 ft') f.push('feet: ' + L.fmtFeet(10));
+    // Kalman: converges, and one reflection spike barely moves it.
+    const k = new L.RssiFilter();
+    for (let i = 0; i < 20; i++) k.update(-70, i * 250);
+    const before = k.value();
+    k.update(-40, 20 * 250);
+    if (Math.abs(before + 70) > 0.5) f.push('RSSI filter did not settle: ' + before);
+    if (k.value() - before > 6) f.push('RSSI filter followed a single spike: ' + k.value());
+    // Estimator: a noise-free lawnmower walk around a source lands close to it.
+    const lat0 = 35.9251, lng0 = -86.8689, tx = 12, ty = -7;
+    const samples = [];
+    for (let r = 0; r < 4; r++) for (let i = 0; i < 40; i++) {
+        const x = -40 + (r % 2 ? 80 - 2 * i : 2 * i), y = -40 + r * 25;
+        const d = Math.hypot(x - tx, y - ty, 1.5);
+        const ll = L.fromLocal(lat0, lng0, x, y);
+        samples.push({ lat: ll.lat, lng: ll.lng, acc: 5, rssi: -45 - 25 * Math.log10(d), t: i });
+    }
+    const est = L.estimateSource(samples);
+    if (!est.ready) f.push('estimate not ready on a full walk: ' + est.reason);
+    else {
+        const p = L.toLocal(lat0, lng0, est.lat, est.lng);
+        const err = Math.hypot(p.x - tx, p.y - ty);
+        if (err > 4) f.push('estimate off by ' + err.toFixed(1) + ' m on clean data');
+        if (!(est.r68 > 0 && est.r95 > est.r68)) f.push('uncertainty radii malformed');
+    }
+    // Too little walking must say so rather than guess.
+    const few = L.estimateSource(samples.slice(0, 3));
+    if (few.ready) f.push('estimate claimed ready from 3 readings');
+    if (f.length) { console.log('FAIL: locate.js:', f); process.exit(1); }
+    console.log('[signalsweep self-test] hunt locator + MGRS/DMS formats: ok');
+}
+
+// Wi-Fi hotspot link: every app-bound line also goes to Wi-Fi clients, the
+// hopper stays put while the hotspot is up, the app knows the transport, and
+// the C5 build compiles it in with the app bundled.
+{
+    const rd = (f) => readFileSync(new URL(f, import.meta.url), 'utf8');
+    const bs = rd('../firmware/src/ble_serial.cpp');
+    const ww = rd('../firmware/src/mode_watchers_watch.cpp');
+    const ini = rd('../firmware/platformio.ini');
+    const app = rd('./public/app.js');
+    const html = rd('./index.html');
+    const w = [];
+    const sendFn = (bs.match(/void sendBleSerial\(const String& data\) \{[\s\S]*?\n\}/) || [''])[0];
+    if (sendFn.indexOf('wifiLinkSend(data);') < 0 || sendFn.indexOf('wifiLinkSend(data);') > sendFn.indexOf('if (!deviceConnected) return;'))
+        w.push('sendBleSerial no longer mirrors to Wi-Fi before its BLE early-returns');
+    if (!/if \(wifiLinkParkChannel\(\) > 0\) continue;/.test(ww)) w.push('channel hopper no longer parks for the hotspot');
+    if (!/WiFi\.mode\(wifiLinkActive\(\) \? WIFI_AP_STA : WIFI_STA\)/.test(ww)) w.push('detector restart would drop the hotspot');
+    if (!/\[env:c5\][\s\S]*-DSIGNALSWEEP_WIFI_LINK[\s\S]*extra_scripts = pre:tools\/gen_web_bundle\.py/.test(ini)) w.push('c5 env lost the Wi-Fi link or the web bundle step');
+    if (!/connectionType === 'WIFI' && wsSock && wsSock\.readyState === 1/.test(app)) w.push('sendCommand has no Wi-Fi branch');
+    if (!/processIncomingChunk\(ev\.data, false\)/.test(app)) w.push('Wi-Fi frames are not fed to the shared reassembler');
+    if (!/<script defer src="\/locate\.js"><\/script>\s*<script defer src="\/app\.js">/.test(html)) w.push('locate.js must load before app.js');
+    if (w.length) { console.log('FAIL: wifi link:', w); process.exit(1); }
+    console.log('[signalsweep self-test] Wi-Fi hotspot link wiring: ok');
+}
+
 const results = await global.__signalsweepSelfTest();
 const failed = Object.entries(results).filter(([, v]) => !v).map(([k]) => k);
 console.log('[signalsweep self-test]', results);

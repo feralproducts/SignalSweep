@@ -95,6 +95,14 @@ jobs:
       - name: Distribution contract
         run: python test_distribution.py
 
+      # Before the firmware: the C5 build compiles app/dist into the image so
+      # the Wi-Fi hotspot can serve it (firmware/tools/gen_web_bundle.py).
+      - name: Build app
+        working-directory: app
+        run: |
+          npm ci
+          npm run build
+
       - name: Build firmware (tier1)
         run: |
           pio run -e tier1 -d firmware
@@ -109,12 +117,6 @@ jobs:
         run: |
           pio run -e c5 -d firmware
           bash site/assemble.sh c5
-
-      - name: Build app
-        working-directory: app
-        run: |
-          npm ci
-          npm run build
 
       # The signed APK, on tags only. Sideload-only: there is no Play Store
       # listing, so the release asset IS the distribution channel.
