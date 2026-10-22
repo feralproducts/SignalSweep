@@ -1428,7 +1428,7 @@
                 if (!meDot) {
                     meAcc = window.L.circle(ll, { radius: mapFix ? mapFix.acc : 10, color: live, weight: 1, opacity: 0.35,
                                                   fillColor: live, fillOpacity: 0.06, interactive: false }).addTo(meLayer);
-                    meDot = window.L.circleMarker(ll, { radius: 7, color: '#fff', weight: 2, fillColor: live, fillOpacity: 1 })
+                    meDot = window.L.circleMarker(ll, { radius: 7, color: cssColor('var(--ss-text)'), weight: 2, fillColor: live, fillOpacity: 1 })
                                 .addTo(meLayer).bindTooltip('You', MAP_LABEL);
                 } else {
                     meDot.setLatLng(ll);
@@ -1555,7 +1555,7 @@
                 if (!P.est) {
                     P.est = window.L.circle(ll, { radius: est.r68, color: amber, weight: 2, dashArray: '4 4',
                                                   fillColor: amber, fillOpacity: 0.12, interactive: false }).addTo(huntLayer);
-                    P.estDot = window.L.circleMarker(ll, { radius: 6, color: '#000', weight: 2, fillColor: amber, fillOpacity: 1 })
+                    P.estDot = window.L.circleMarker(ll, { radius: 6, color: cssColor('var(--ss-bg)'), weight: 2, fillColor: amber, fillOpacity: 1 })
                         .addTo(huntLayer).bindTooltip('Estimate', MAP_LABEL)
                         .bindPopup(function () { return huntEstPopup(); });
                 } else {
@@ -1566,7 +1566,7 @@
             }
             const peak = est && est.peak;
             if (peak) {
-                if (!P.peak) P.peak = window.L.circleMarker([peak.lat, peak.lng], { radius: 5, color: '#fff', weight: 2,
+                if (!P.peak) P.peak = window.L.circleMarker([peak.lat, peak.lng], { radius: 5, color: cssColor('var(--ss-text)'), weight: 2,
                                         fillColor: cssColor('var(--ss-live)'), fillOpacity: 1 })
                                     .addTo(huntLayer).bindTooltip('Strongest', MAP_LABEL);
                 else P.peak.setLatLng([peak.lat, peak.lng]);
@@ -1632,10 +1632,11 @@
         // gates viewing and export, and nothing else.
         function pinIcon(source) {
             const fill = source === 'estimate' ? cssColor('var(--accent-amber)') : cssColor('var(--ss-live)');
+            const ink = cssColor('var(--ss-bg)');
             return window.L.divIcon({
                 className: 'ss-pin',
                 html: '<svg width="26" height="34" viewBox="0 0 26 34" aria-hidden="true"><path d="M13 1C6.4 1 1 6.3 1 12.9 1 22 13 33 13 33s12-11 12-20.1C25 6.3 19.6 1 13 1z" fill="' +
-                      fill + '" stroke="#000" stroke-width="1.5"/><circle cx="13" cy="13" r="4.5" fill="#000"/></svg>',
+                      fill + '" stroke="' + ink + '" stroke-width="1.5"/><circle cx="13" cy="13" r="4.5" fill="' + ink + '"/></svg>',
                 iconSize: [26, 34], iconAnchor: [13, 33], popupAnchor: [0, -30]
             });
         }
