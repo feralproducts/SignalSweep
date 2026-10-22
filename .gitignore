@@ -67,3 +67,4 @@ hardware/*
 firmware/src/bench/
 *.local.ini
 docs/SignalSweep-Brand/
+firmware/src/web_bundle.gen.cpp

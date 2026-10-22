@@ -19,6 +19,12 @@
   <sub><b>Hardware</b> you carry · <b>open firmware</b> you flash from a browser · an <b>app</b> if you want one. It beeps without it.</sub>
 </p>
 
+> **This fork (XIAO ESP32-C5):** the board can run its own Wi‑Fi hotspot and
+> serve the app, so **iPhones, iPads, Safari and Firefox** work too; the map and
+> hunt meter are smoothed; and a hunt now **estimates where the device is** and
+> lets you **pin it** (lat/long, DMS, MGRS) to share with a team. See
+> [docs/WIFI-HOTSPOT-AND-PINNING.md](docs/WIFI-HOTSPOT-AND-PINNING.md).
+
 > **But wait, there's more.** It decodes the drone **and where the pilot is
 > standing**. It hunts a tracker by ear, beeping faster as you close in. It
 > catches a fake-AirTag spam storm and **stops crying wolf**. It names your
