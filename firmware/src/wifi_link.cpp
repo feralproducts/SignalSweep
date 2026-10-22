@@ -627,22 +627,25 @@ static bool startServers() {
     sc.prvtkey_pem    = (const uint8_t*)keyPem;
     sc.prvtkey_len    = strlen(keyPem) + 1;
     // cacert_pem stays NULL: it would demand client certificates.
-    // Safari opens several connections at once to load a page. With too few
-    // slots the LRU purge could close the live WebSocket to make room; the
-    // app also sends a keepalive every few seconds so the socket stays
-    // recently used. 6 TLS + 2 plain + the servers' own = 14 of 16 lwIP sockets.
-    sc.httpd.max_open_sockets = 6;
+    // Each open TLS session costs memory, and a browser opens several at once
+    // to load a page; 4 is the balance between page-load speed and the
+    // internal RAM left with BLE + Wi-Fi running. The LRU purge may close an
+    // idle keep-alive socket to admit a new one; the app's WebSocket sends a
+    // keepalive every few seconds so it stays recently used.
+    sc.httpd.max_open_sockets = 4;
     sc.httpd.max_uri_handlers = 4;
     sc.httpd.lru_purge_enable = true;
     sc.httpd.uri_match_fn = httpd_uri_match_wildcard;
-    sc.httpd.stack_size = 16384;   // TLS handshake + ECDSA on this task
-    // Stacks in PSRAM (CONFIG_SPIRAM_ALLOW_STACK_EXTERNAL_MEMORY=y in this
-    // core). Field status page, 2026-10-22: with the hotspot up, internal RAM
-    // was down to ~15 KB free -- too little for the next connection, so the
-    // page half-loaded and the app's WebSocket never opened. These two server
-    // stacks plus the sender task's were ~24 KB of it. Neither server task
-    // writes flash, so a PSRAM stack is safe here.
-    sc.httpd.task_caps = MALLOC_CAP_SPIRAM | MALLOC_CAP_8BIT;
+    // The HTTPS task's stack stays in INTERNAL RAM. Field test 2026-10-22:
+    // with it in PSRAM, internal RAM recovered (43 KB free) but every TLS
+    // handshake failed (0 https requests served, was 5) -- the crypto path
+    // does not tolerate a PSRAM stack. 12 KB: above the IDF default (10 KB)
+    // for the ECDSA handshake, without the 16 KB this briefly had.
+    sc.httpd.stack_size = 12288;
+    // Fewer simultaneous TLS sessions: a browser opens a burst of connections
+    // for one page; past this they wait in the listen backlog instead of
+    // each taking memory at once.
+    sc.httpd.backlog_conn = 8;
     if (httpd_ssl_start(&httpsServer, &sc) != ESP_OK) { httpsServer = NULL; return false; }
 
     httpd_uri_t ws = {};
@@ -658,6 +661,9 @@ static bool startServers() {
     hc.ctrl_port = ESP_HTTPD_DEF_CTRL_PORT + 2;   // the SSL server took +1
     hc.max_uri_handlers = 2;
     hc.max_open_sockets = 2;
+    // The plain-HTTP server (setup page, /status, CA download) does no TLS, so
+    // its stack can live in PSRAM (SPIRAM_ALLOW_STACK_EXTERNAL_MEMORY=y);
+    // field-proven 2026-10-22. Same for the WifiLinkTx task below.
     hc.task_caps = MALLOC_CAP_SPIRAM | MALLOC_CAP_8BIT;
     hc.uri_match_fn = httpd_uri_match_wildcard;
     hc.lru_purge_enable = true;
