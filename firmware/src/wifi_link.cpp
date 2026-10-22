@@ -100,8 +100,19 @@ static size_t caDerLen = 0;
 // out of memory and the phone saw "the network connection was lost" (first
 // field test, iPhone 15, 2026-10-22). The board has 8 MB of PSRAM: send TLS
 // there, falling back to internal RAM only if PSRAM is somehow full.
+//
+// SCOPED to the HTTP server tasks (named "httpd"), where the TLS sessions
+// live. The first version swapped the allocator for every mbedtls user on the
+// board -- and the Wi-Fi stack's own WPA2 handshake runs on mbedtls too; phones
+// then saw the hotspot but could no longer join it (field test, 2026-10-22).
+// Every other task gets exactly the core's default: internal RAM.
 static volatile uint32_t tlsPsramFallbacks = 0;
+static inline bool onHttpdTask() {
+    const char* n = pcTaskGetName(NULL);
+    return n && n[0] == 'h' && strcmp(n, "httpd") == 0;
+}
 static void* tlsCalloc(size_t n, size_t size) {
+    if (!onHttpdTask()) return heap_caps_calloc(n, size, MALLOC_CAP_INTERNAL | MALLOC_CAP_8BIT);
     void* p = heap_caps_calloc(n, size, MALLOC_CAP_SPIRAM | MALLOC_CAP_8BIT);
     if (!p) { p = heap_caps_calloc(n, size, MALLOC_CAP_INTERNAL | MALLOC_CAP_8BIT); tlsPsramFallbacks = tlsPsramFallbacks + 1; }
     return p;
